@@ -51,17 +51,21 @@ jobs:
           # LevelDB library through leviworld and does not need this executable.
           cmake_file = Path('app/src/main/cpp/worldtools/vendor/leveldb/CMakeLists.txt')
           cm = cmake_file.read_text(encoding='utf-8')
-          old_block = '''add_executable(leveldbutil
-  "db/leveldbutil.cc"
-)
-target_link_libraries(leveldbutil leveldb)'''
-          new_block = '''# leveldbutil is a desktop command-line tool; it is not used in the Android app.
-if(NOT ANDROID)
-  add_executable(leveldbutil
-    "db/leveldbutil.cc"
-  )
-  target_link_libraries(leveldbutil leveldb)
-endif()'''
+          old_block = "\n".join([
+              "add_executable(leveldbutil",
+              '  "db/leveldbutil.cc"',
+              ")",
+              "target_link_libraries(leveldbutil leveldb)",
+          ])
+          new_block = "\n".join([
+              "# leveldbutil is a desktop command-line tool; it is not used in the Android app.",
+              "if(NOT ANDROID)",
+              "  add_executable(leveldbutil",
+              '    "db/leveldbutil.cc"',
+              "  )",
+              "  target_link_libraries(leveldbutil leveldb)",
+              "endif()",
+          ])
           if old_block in cm:
               cm = cm.replace(old_block, new_block, 1)
               cmake_file.write_text(cm, encoding='utf-8')
@@ -80,34 +84,38 @@ endif()'''
           # and preserve FNV-1a 64-bit on 64-bit builds.
           hash_file = Path('app/src/main/cpp/worldtools/vendor/nbt/src/nbt/detail/StringUtils.hpp')
           hs = hash_file.read_text(encoding='utf-8')
-          old_hash = '''[[nodiscard]] constexpr size_t doHash(std::string_view x) {
-    size_t           hash  = 0xcbf29ce484222325;
-    constexpr size_t prime = 0x100000001b3;
-    for (char c : x) {
-        hash ^= static_cast<size_t>(c);
-        hash *= prime;
-    }
-    return hash;
-}'''
-          new_hash = '''[[nodiscard]] constexpr size_t doHash(std::string_view x) {
-    if constexpr (sizeof(size_t) <= sizeof(uint32_t)) {
-        uint32_t hash = 0x811c9dc5u;
-        constexpr uint32_t prime = 0x01000193u;
-        for (char c : x) {
-            hash ^= static_cast<uint32_t>(static_cast<unsigned char>(c));
-            hash *= prime;
-        }
-        return static_cast<size_t>(hash);
-    } else {
-        uint64_t hash = 0xcbf29ce484222325ULL;
-        constexpr uint64_t prime = 0x100000001b3ULL;
-        for (char c : x) {
-            hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-            hash *= prime;
-        }
-        return static_cast<size_t>(hash);
-    }
-}'''
+          old_hash = "\n".join([
+              "[[nodiscard]] constexpr size_t doHash(std::string_view x) {",
+              "    size_t           hash  = 0xcbf29ce484222325;",
+              "    constexpr size_t prime = 0x100000001b3;",
+              "    for (char c : x) {",
+              "        hash ^= static_cast<size_t>(c);",
+              "        hash *= prime;",
+              "    }",
+              "    return hash;",
+              "}",
+          ])
+          new_hash = "\n".join([
+              "[[nodiscard]] constexpr size_t doHash(std::string_view x) {",
+              "    if constexpr (sizeof(size_t) <= sizeof(uint32_t)) {",
+              "        uint32_t hash = 0x811c9dc5u;",
+              "        constexpr uint32_t prime = 0x01000193u;",
+              "        for (char c : x) {",
+              "            hash ^= static_cast<uint32_t>(static_cast<unsigned char>(c));",
+              "            hash *= prime;",
+              "        }",
+              "        return static_cast<size_t>(hash);",
+              "    } else {",
+              "        uint64_t hash = 0xcbf29ce484222325ULL;",
+              "        constexpr uint64_t prime = 0x100000001b3ULL;",
+              "        for (char c : x) {",
+              "            hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));",
+              "            hash *= prime;",
+              "        }",
+              "        return static_cast<size_t>(hash);",
+              "    }",
+              "}",
+          ])
           if old_hash in hs:
               hs = hs.replace(old_hash, new_hash, 1)
               if '#include <cstdint>' not in hs:
@@ -160,7 +168,7 @@ endif()'''
         with:
           packages: platform-tools
 
-      - name: Install Android SDK, project-matched NDK, and CMake
+      - name: Install Android SDK, matching NDK 28.2, and CMake
         shell: bash
         run: |
           set -euo pipefail
@@ -168,7 +176,7 @@ endif()'''
           sdkmanager \
             'platforms;android-36' \
             'build-tools;36.0.0' \
-            'ndk;27.2.12479018' \
+            'ndk;28.2.13676358' \
             'cmake;3.22.1'
 
       - name: Build debug APK for ARMv7 and capture all output
@@ -230,3 +238,4 @@ endif()'''
           name: LeviLauncher-ARMv7-debug-APK
           path: LeviLauncher-ARMv7-debug.apk
           if-no-files-found: error
+          retention-days: 7
