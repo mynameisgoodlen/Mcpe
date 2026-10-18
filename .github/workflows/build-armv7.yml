@@ -1,4 +1,4 @@
-name: Build LeviLauncher for ARMv7
+name: Build LeviLauncher for ARMv7 (diagnostic)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-armv7:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out this builder workflow
         uses: actions/checkout@v4
@@ -25,27 +25,57 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Configure Gradle and app for 32-bit ARM
+      - name: Configure source for ARMv7 and avoid desktop-only LevelDB utility
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('app/build.gradle')
-          s = p.read_text(encoding='utf-8')
+
+          # Make the app target 32-bit ARM for this experimental build.
+          gradle_file = Path('app/build.gradle')
+          s = gradle_file.read_text(encoding='utf-8')
           old = "abiFilters 'arm64-v8a'"
           if s.count(old) != 1:
-              raise SystemExit(f'Expected one ABI filter in app/build.gradle, found {s.count(old)}; upstream source has changed.')
+              raise SystemExit(
+                  f'Expected exactly one ABI filter {old!r}; found {s.count(old)}. '
+                  'Upstream may have changed; refusing to patch the wrong file.'
+              )
           s = s.replace(old, "abiFilters 'armeabi-v7a'")
-          # An APK can be built without the project's private Firebase upload settings.
-          # Keep the app's Crashlytics dependency, but disable symbol/mapping uploads.
           s = s.replace('mappingFileUploadEnabled true', 'mappingFileUploadEnabled false')
           s = s.replace('nativeSymbolUploadEnabled true', 'nativeSymbolUploadEnabled false')
-          p.write_text(s, encoding='utf-8')
-          print('Set app ABI to armeabi-v7a and disabled CI-only Firebase symbol uploads.')
+          gradle_file.write_text(s, encoding='utf-8')
+
+          # leveldbutil is a standalone desktop CLI; the Android app uses the
+          # LevelDB library through leviworld and does not need this executable.
+          cmake_file = Path('app/src/main/cpp/worldtools/vendor/leveldb/CMakeLists.txt')
+          cm = cmake_file.read_text(encoding='utf-8')
+          old_block = '''add_executable(leveldbutil
+  "db/leveldbutil.cc"
+)
+target_link_libraries(leveldbutil leveldb)'''
+          new_block = '''# leveldbutil is a desktop command-line tool; it is not used in the Android app.
+if(NOT ANDROID)
+  add_executable(leveldbutil
+    "db/leveldbutil.cc"
+  )
+  target_link_libraries(leveldbutil leveldb)
+endif()'''
+          if old_block in cm:
+              cm = cm.replace(old_block, new_block, 1)
+              cmake_file.write_text(cm, encoding='utf-8')
+              print('Skipped the desktop-only leveldbutil target for Android.')
+          elif 'if(NOT ANDROID)' in cm and 'add_executable(leveldbutil' in cm:
+              print('leveldbutil already has an Android guard; leaving it unchanged.')
+          else:
+              raise SystemExit(
+                  f'Expected leveldbutil block not found in {cmake_file}; '
+                  'upstream changed. No guessed CMake patch applied.'
+              )
+
+          print('Configured the app for armeabi-v7a.')
           PY
-          mkdir -p app
           cat > app/google-services.json <<'JSON'
           {
             "project_info": {
@@ -80,12 +110,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # The action's default includes the obsolete SDK package named "tools",
-          # which makes sdkmanager exit with "Failed to find package 'tools'".
-          # Install platform-tools here; install the required SDK components below.
           packages: platform-tools
 
-      - name: Install Android 36, NDK and CMake
+      - name: Install Android SDK, project-matched NDK, and CMake
         shell: bash
         run: |
           set -euo pipefail
@@ -93,16 +120,52 @@ jobs:
           sdkmanager \
             'platforms;android-36' \
             'build-tools;36.0.0' \
-            'ndk;28.2.13676358' \
+            'ndk;27.2.12479018' \
             'cmake;3.22.1'
 
-      - name: Build debug APK for ARMv7
+      - name: Build debug APK for ARMv7 and capture all output
+        id: build
         working-directory: source
+        shell: bash
         env:
           GRADLE_OPTS: -Dorg.gradle.daemon=false
-        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/gradle-native-build.log"
+          echo "Full build log: $LOG"
+          ./gradlew --no-daemon --stacktrace --info --console=plain :app:assembleDebug 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          exit "$rc"
+
+      - name: Summarize native errors if the build failed
+        if: failure() || steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/gradle-native-build.log"
+          {
+            echo '## Native build diagnostics'
+            echo
+            if [ -s "$LOG" ]; then
+              echo 'First matching compiler/linker/Ninja diagnostics (the full log is attached as an artifact):'
+              echo '```text'
+              grep -n -E 'fatal error:|(^|[[:space:]])error:|undefined reference|cannot find|No such file or directory|FAILED:|ninja: build stopped|CMake Error' "$LOG" | head -n 100 || true
+              echo '```'
+            else
+              echo 'No build log was created; check the preceding setup step.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full build log for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Verify the APK targets ARMv7
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
@@ -113,6 +176,7 @@ jobs:
           cp "$APK" 'LeviLauncher-ARMv7-debug.apk'
 
       - name: Upload installable APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: LeviLauncher-ARMv7-debug-APK
