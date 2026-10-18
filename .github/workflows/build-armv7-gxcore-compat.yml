@@ -1,0 +1,181 @@
+name: Build ARMv7 compatibility APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept SDK licenses and install platform packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '2.9.9'
+          actions-cache-folder: '.xmake-cache'
+          actions-cache-key: 'ubuntu-armv7-compat'
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          link-to-sdk: true
+
+      - name: Add ARMv7 compatibility shim and patch build configuration
+        run: |
+          set -euo pipefail
+          test -f app/src/main/cpp/CMakeLists.txt
+          test -f app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftRuntimePreparer.kt
+          test -f app/build.gradle
+
+          cat > app/src/main/cpp/armv7_gxcore_compat.cpp <<'CPP'
+          /* Experimental ARMv7 shim. It is not feature-equivalent to proprietary gxcore. */
+          using jboolean = unsigned char;
+          using jobject = void *;
+          using jclass = void *;
+          using jstring = void *;
+          struct JNIEnv;
+          #define JNI_FALSE ((jboolean)0)
+          #define JNIEXPORT __attribute__((visibility("default")))
+          #define JNICALL
+          extern "C" JNIEXPORT jboolean JNICALL Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage(JNIEnv *e, jclass c, jstring p) { (void)e; (void)c; (void)p; return JNI_FALSE; }
+          extern "C" JNIEXPORT jboolean JNICALL Java_org_levimc_launcher_util_NativeBridgeHelper_nativeRewriteImage(JNIEnv *e, jclass c, jstring i, jstring o) { (void)e; (void)c; (void)i; (void)o; return JNI_FALSE; }
+          extern "C" JNIEXPORT void JNICALL Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore(JNIEnv *e, jclass c) { (void)e; (void)c; }
+          extern "C" JNIEXPORT jstring JNICALL Java_org_levimc_launcher_util_NativeBridgeHelper_nativeLoadMinecraftRuntime(JNIEnv *e, jclass c, jstring p) { (void)e; (void)c; (void)p; return nullptr; }
+          CPP
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          cmake_path = Path('app/src/main/cpp/CMakeLists.txt')
+          cmake = cmake_path.read_text(encoding='utf-8')
+          marker = 'ARMV7_GXCORE_COMPAT_SHIM'
+          if marker not in cmake:
+              cmake += '''\n\n# ARMV7_GXCORE_COMPAT_SHIM\n# The upstream proprietary libgxcore binary is shipped for ARM64 only.\nif(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")\n    add_library(gxcore SHARED armv7_gxcore_compat.cpp)\n    set_target_properties(gxcore PROPERTIES OUTPUT_NAME "gxcore")\n    target_compile_options(gxcore PRIVATE -fvisibility=hidden -fno-exceptions -fno-rtti)\nendif()\n'''
+              cmake_path.write_text(cmake, encoding='utf-8')
+
+          gradle_path = Path('app/build.gradle')
+          gradle = gradle_path.read_text(encoding='utf-8')
+          gradle, count = re.subn(r"(?m)^\s*abiFilters.*$", "            abiFilters 'armeabi-v7a'", gradle, count=1)
+          if count == 0:
+              raise SystemExit('Could not find an abiFilters line in app/build.gradle')
+          gradle_path.write_text(gradle, encoding='utf-8')
+
+          runtime_path = Path('app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftRuntimePreparer.kt')
+          runtime = runtime_path.read_text(encoding='utf-8')
+          needle = 'if (gameManager.shouldLoadMallocRedirect()) {'
+          replacement = 'if (gameManager.shouldLoadMallocRedirect() && Build.SUPPORTED_ABIS.firstOrNull() != "armeabi-v7a") {'
+          position = runtime.find(needle)
+          if position < 0:
+              raise SystemExit('Could not find the early native runtime-load condition')
+          runtime = runtime[:position] + replacement + runtime[position + len(needle):]
+          runtime_path.write_text(runtime, encoding='utf-8')
+
+          print('ARMv7 shim added; ABI filter and early runtime-load path patched.')
+          PY
+
+      - name: Prepare Firebase config for CI build
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          if [ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > app/google-services.json
+          elif [ ! -f app/google-services.json ]; then
+            cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "ci-placeholder",
+              "storage_bucket": "ci-placeholder.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                "android_client_info": {"package_name": "org.levimc.launcher"}
+              },
+              "oauth_client": [],
+              "api_key": [{"current_key": "AIzaSyCIOnlyPlaceholderKey"}],
+              "services": {"appinvite_service": {"other_platform_oauth_client": []}}
+            }],
+            "configuration_version": "1"
+          }
+          JSON
+          fi
+          if [ -n "${CURSEFORGE_API_KEY:-}" ]; then
+            printf '\ncurseforge.api_key=%s\n' "$CURSEFORGE_API_KEY" >> local.properties
+          fi
+
+      - name: Build debug APK
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon clean :app:assembleDebug --stacktrace
+
+      - name: Verify ARMv7 libraries are packaged
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          apk = sys.argv[1]
+          required = {
+              'lib/armeabi-v7a/libgxcore.so',
+              'lib/armeabi-v7a/libc++_shared.so',
+          }
+          with zipfile.ZipFile(apk) as z:
+              names = set(z.namelist())
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit('Required ARMv7 entries missing: ' + ', '.join(missing))
+              so = z.read('lib/armeabi-v7a/libgxcore.so')
+              if so[:4] != b'\x7fELF' or so[4] != 1 or so[5] != 1 or int.from_bytes(so[18:20], 'little') != 40:
+                  raise SystemExit('libgxcore.so is not a little-endian 32-bit ARM ELF')
+              for symbol in (
+                  b'Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage',
+                  b'Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore',
+                  b'Java_org_levimc_launcher_util_NativeBridgeHelper_nativeLoadMinecraftRuntime',
+              ):
+                  if symbol not in so:
+                      raise SystemExit('Missing JNI symbol: ' + symbol.decode())
+          print('Verified ARMv7 ELF and required packaged libraries in', apk)
+          PY
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-gxcore-compat
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
