@@ -1,0 +1,121 @@
+name: Build LeviLauncher for ARMv7
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this builder workflow
+        uses: actions/checkout@v4
+
+      - name: Check out LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: main
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure Gradle and app for 32-bit ARM
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle')
+          s = p.read_text(encoding='utf-8')
+          old = "abiFilters 'arm64-v8a'"
+          if s.count(old) != 1:
+              raise SystemExit(f'Expected one ABI filter in app/build.gradle, found {s.count(old)}; upstream source has changed.')
+          s = s.replace(old, "abiFilters 'armeabi-v7a'")
+          # An APK can be built without the project's private Firebase upload settings.
+          # Keep the app's Crashlytics dependency, but disable symbol/mapping uploads.
+          s = s.replace('mappingFileUploadEnabled true', 'mappingFileUploadEnabled false')
+          s = s.replace('nativeSymbolUploadEnabled true', 'nativeSymbolUploadEnabled false')
+          p.write_text(s, encoding='utf-8')
+          print('Set app ABI to armeabi-v7a and disabled CI-only Firebase symbol uploads.')
+          PY
+          mkdir -p app
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "ci-placeholder",
+              "storage_bucket": "ci-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {"package_name": "org.levimc.launcher"}
+                },
+                "oauth_client": [],
+                "api_key": [{"current_key": "AIzaSyCIOnlyPlaceholderKey"}],
+                "services": {"appinvite_service": {"other_platform_oauth_client": []}}
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+          chmod +x ./gradlew
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action's default includes the obsolete SDK package named "tools",
+          # which makes sdkmanager exit with "Failed to find package 'tools'".
+          # Install platform-tools here; install the required SDK components below.
+          packages: platform-tools
+
+      - name: Install Android 36, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;28.2.13676358' \
+            'cmake;3.22.1'
+
+      - name: Build debug APK for ARMv7
+        working-directory: source
+        env:
+          GRADLE_OPTS: -Dorg.gradle.daemon=false
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify the APK targets ARMv7
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='source/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | tee /tmp/apk-badging.txt
+          grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt
+          cp "$APK" 'LeviLauncher-ARMv7-debug.apk'
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-debug-APK
+          path: LeviLauncher-ARMv7-debug.apk
+          if-no-files-found: error
+          retention-days: 7
