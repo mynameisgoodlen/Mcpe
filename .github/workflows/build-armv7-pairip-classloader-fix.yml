@@ -321,13 +321,6 @@ jobs:
               '                } else if (normalizedName == "pairipcore") {',
               '                    // Initialize through the original Minecraft package loader.',
               '                    initializeOfficialPairIp()',
-              '                } else if (normalizedName == "PlayFabMultiplayer" ||',
-              '                           normalizedName == "maesdk") {',
-              '                    try {',
-              '                        System.loadLibrary(normalizedName)',
-              '                    } catch (bundledError: UnsatisfiedLinkError) {',
-              '                        loadInstalledGameLibrary(fileName, bundledError)',
-              '                    }',
               '                } else {',
               '                    System.loadLibrary(normalizedName)',
               '                }',
@@ -380,8 +373,8 @@ jobs:
               '            if (!result.loaded) {',
               '                Log.e(TAG, "Failed to load bundle library $libName: ${result.detail ?: "unknown error"}")',
               '                listener?.onLog("Failed to load native library: ${result.fileName}")',
-              '                if (lib == "libpairipcore.so" || requiredLibs.contains(lib)) {',
-              '                    throw UnsatisfiedLinkError(',
+              '                if (libName == "pairipcore" || requiredLibs.any { normalizeLibraryName(it) == libName }) {',
+              '                    throw IllegalStateException(',
               '                        "Required Minecraft library ${result.fileName} failed to initialize: ${result.detail ?: "unknown error"}"',
               '                    )',
               '                }',
@@ -394,13 +387,16 @@ jobs:
           else:
               raise SystemExit('Could not add required-library fail-fast guard; refusing to guess.')
 
-          # Static guard: the PairIP branch must not use the direct installed-file fallback.
+          # Static guards: don't leave the undefined helper that broke the prior build,
+          # and verify the PairIP path uses Minecraft's package class loader.
+          if 'loadInstalledGameLibrary(' in s:
+              raise SystemExit('Undefined loadInstalledGameLibrary reference remains; refusing to build.')
           pairip_start = s.find('} else if (normalizedName == "pairipcore") {')
-          pairip_end = s.find('} else if (normalizedName == "PlayFabMultiplayer"', pairip_start)
+          pairip_end = s.find('} else {', pairip_start)
           if pairip_start < 0 or pairip_end < 0:
               raise SystemExit('Could not verify the PairIP-specific load branch.')
           if 'loadInstalledGameLibrary' in s[pairip_start:pairip_end]:
-              raise SystemExit('PairIP still has a direct-load fallback; refusing to build.')
+              raise SystemExit('PairIP still has an invalid fallback; refusing to build.')
           if 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)' not in s:
               raise SystemExit('Official PairIP class-loader initialization is missing.')
           path.write_text(s, encoding='utf-8')
