@@ -1,4 +1,4 @@
-name: Build LeviLauncher ARMv7 installed-dependency compatibility APK (experimental)
+name: Build LeviLauncher ARMv7.yaml installed-dependency compatibility APK (experimental)
 
 on:
   workflow_dispatch:
