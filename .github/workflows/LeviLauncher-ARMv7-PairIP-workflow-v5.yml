@@ -1,4 +1,4 @@
-name: Build LeviLauncher ARMv7 PairIP launcher-loader APK v5
+name: Build LeviLauncher ARMv7 PairIP class-loader APK v5
 
 on:
   workflow_dispatch:
@@ -341,44 +341,19 @@ jobs:
               raise SystemExit('Could not find expected runtime-loader condition; refusing to guess.')
           PYCODE
 
-      - name: Add PairIP VMRunner shim and initialize PairIP in the launcher class loader
+      - name: Prepare PairIP ordering before the final runtime-loader patch
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p app/src/main/java/com/pairip
-          cat > app/src/main/java/com/pairip/VMRunner.java <<'JAVA'
-          package com.pairip;
-
-          /**
-           * Minimal stand-in for Google's PairIP com.pairip.VMRunner.
-           * libpairipcore.so's JNI_OnLoad looks this class up and registers exactly one native:
-           *   public static native Object executeVM(byte[] vmCode, Object[] args)
-           * Loading the library from here initializes the same libpairipcore instance that the
-           * PairIP-protected Minecraft libraries link against inside the launcher process.
-           */
-          public final class VMRunner {
-              static {
-                  System.loadLibrary("pairipcore");
-              }
-
-              private VMRunner() {}
-
-              public static native Object executeVM(byte[] vmCode, Object[] args);
-          }
-          JAVA
-          if [ -f app/proguard-rules.pro ] && ! grep -q 'com.pairip.VMRunner' app/proguard-rules.pro; then
-            printf '\n-keep class com.pairip.VMRunner { *; }\n-keepclasseswithmembernames class * { native <methods>; }\n' >> app/proguard-rules.pro
-          fi
           python3 - <<'PY'
           from pathlib import Path
 
           path = Path('app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt')
           s = path.read_text(encoding='utf-8')
 
-          # PairIP must initialize in the launcher class loader: the protected Minecraft libraries bind
-          # their libpairipcore.so dependency inside the launcher namespace. A shim com.pairip.VMRunner
-          # (added below) lets JNI_OnLoad find the class and register executeVM there.
+          # PairIP must initialize from Minecraft's official class loader. Directly loading
+          # libpairipcore.so from the launcher class loader caused the uploaded JNI_OnLoad abort.
           array_start = s.find('private val systemLoadedLibs = arrayOf(')
           if array_start < 0:
               raise SystemExit('systemLoadedLibs definition not found; refusing to patch.')
@@ -417,7 +392,7 @@ jobs:
           ])
           new_load = '\n'.join([
               '                } else if (normalizedName == "pairipcore") {',
-              '                    // Initialize PairIP in the launcher class loader (single shared instance).',
+              '                    // Initialize through the original Minecraft package loader.',
               '                    initializeOfficialPairIp()',
               '                } else {',
               '                    System.loadLibrary(normalizedName)',
@@ -435,25 +410,19 @@ jobs:
           helper_marker = '    fun loadAllLibraries(\n'
           helper = '\n'.join([
               '    /**',
-              "     * PairIP-protected Minecraft libraries (PlayFab, Mae, minecraftpe) list libpairipcore.so as a",
-              "     * DT_NEEDED dependency. Android resolves that inside the launcher's own native namespace, so the",
-              "     * copy that must be initialized is the launcher's copy. Its JNI_OnLoad needs com.pairip.VMRunner",
-              "     * (shim added by the build) so it can bind executeVM. Initializing a second copy through the Mojang",
-              "     * class loader leaves the bound copy uninitialized and the protected library crashes in its constructor.",
+              "     * Initialize the official PairIP Java entry point using Minecraft's own class loader.",
+              '     * Its static initializer should load the original library in its expected JNI context.',
+              '     * Never fall back to direct System.load for PairIP.',
               '     */',
               '    private fun initializeOfficialPairIp() {',
               '        try {',
-              '            Class.forName("com.pairip.VMRunner", true, GamePackageManager::class.java.classLoader)',
-              '            val mapped = try {',
-              '                File("/proc/self/maps").readLines().filter { it.contains("libpairipcore.so") }',
-              '                    .map { it.substringAfterLast(\' \') }.distinct()',
-              '            } catch (ignored: Throwable) { emptyList() }',
-              '            report("Initialized PairIP in launcher class loader; mapped copies: $mapped")',
+              '            Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)',
+              '            report("Initialized official PairIP runtime using Minecraft package class loader")',
               '        } catch (error: Throwable) {',
               '            val detail = error.message ?: error.javaClass.simpleName',
-              '            Log.e(TAG, "PairIP launcher-loader initialization failed: $detail", error)',
+              '            Log.e(TAG, "Official PairIP class-loader initialization failed: $detail", error)',
               '            throw UnsatisfiedLinkError(',
-              '                "Cannot initialize PairIP in the launcher class loader: $detail"',
+              '                "Cannot initialize official PairIP using Minecraft class loader: $detail"',
               '            ).also { it.initCause(error) }',
               '        }',
               '    }',
@@ -501,13 +470,13 @@ jobs:
               raise SystemExit('Could not verify the PairIP-specific load branch.')
           if 'loadInstalledGameLibrary' in s[pairip_start:pairip_end]:
               raise SystemExit('PairIP still has an invalid fallback; refusing to build.')
-          if 'Class.forName("com.pairip.VMRunner", true, GamePackageManager::class.java.classLoader)' not in s:
-              raise SystemExit('PairIP launcher-loader initialization is missing.')
+          if 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)' not in s:
+              raise SystemExit('Official PairIP class-loader initialization is missing.')
           path.write_text(s, encoding='utf-8')
-          print('Patched PairIP initialization to use the launcher class loader.')
+          print('Patched PairIP initialization to use the installed Minecraft class loader.')
           PY
 
-          grep -q 'Class.forName("com.pairip.VMRunner", true, GamePackageManager::class.java.classLoader)' \
+          grep -q 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)' \
             app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
 
       - name: Extract and preload PlayFab and Mae dependencies before Minecraft
@@ -574,12 +543,12 @@ jobs:
 
           # These two libraries are intentionally loaded by absolute path from the
           # cache extracted from Minecraft's split APKs, not with System.loadLibrary().
-          load_pattern = r'(?m)^([ \t]*)\} else if \(normalizedName == "pairipcore"\) \{\n[ \t]*// Initialize PairIP in the launcher class loader \(single shared instance\)\.\n[ \t]*initializeOfficialPairIp\(\)\n[ \t]*\} else \{\n[ \t]*System\.loadLibrary\(normalizedName\)\n[ \t]*\}'
+          load_pattern = r'(?m)^([ \t]*)\} else if \(normalizedName == "pairipcore"\) \{\n[ \t]*// Initialize through the original Minecraft package loader\.\n[ \t]*initializeOfficialPairIp\(\)\n[ \t]*\} else \{\n[ \t]*System\.loadLibrary\(normalizedName\)\n[ \t]*\}'
           def replace_load(match):
               i = match.group(1)
               return '\n'.join([
                   i + '} else if (normalizedName == "pairipcore") {',
-                  i + '    // Initialize PairIP in the launcher class loader (single shared instance).',
+                  i + '    // Initialize through the original Minecraft package loader.',
                   i + '    initializeOfficialPairIp()',
                   i + '} else if (normalizedName == "PlayFabMultiplayer" || normalizedName == "maesdk") {',
                   i + '    val extractedDependency = File(nativeLibDir, fileName)',
@@ -627,6 +596,261 @@ jobs:
           grep -q 'runtimeDependencyLibs' app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
           grep -q 'System.load(extractedDependency.absolutePath)' app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
 
+      - name: Load the Minecraft native dependency chain with a shared game-parent classloader
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt')
+          s = path.read_text(encoding='utf-8')
+
+          # PairIP and the PlayFab/Mae libraries have DT_NEEDED links to one another.
+          # Keep them in the same extracted directory and preserve PairIP's original bytes.
+          dep_pattern = r'(?ms)^    private val runtimeDependencyLibs = arrayOf\(\n.*?^    \)'
+          m = re.search(dep_pattern, s)
+          if not m:
+              raise SystemExit('runtimeDependencyLibs block not found; refusing to guess.')
+          dep_block = m.group(0)
+          if '"libpairipcore.so"' not in dep_block:
+              needle = '        "libPlayFabMultiplayer.so",'
+              if dep_block.count(needle) != 1:
+                  raise SystemExit('Could not add PairIP to runtime dependency extraction.')
+              dep_block = dep_block.replace(needle, '        "libpairipcore.so",\n' + needle, 1)
+              s = s[:m.start()] + dep_block + s[m.end():]
+
+          # PairIP is a protected dependency; it must be byte-identical, not passed
+          # through the launcher image-rewrite shim.
+          native_marker = '    private fun processNativeImage(file: File, force: Boolean = false): Boolean {\n'
+          if native_marker not in s:
+              raise SystemExit('processNativeImage method not found; refusing to patch.')
+          if 'PairIP bytes must stay original' not in s:
+              s = s.replace(
+                  native_marker,
+                  native_marker +
+                  '        // PairIP bytes must stay original; its JNI/runtime checks are loader-sensitive.\n' +
+                  '        if (file.name == "libpairipcore.so") return true\n', 1)
+
+          # The optional HttpClient library is a DT_NEEDED dependency on recent
+          # Minecraft builds, so attempt it before libminecraftpe.so as well.
+          order_pattern = r'(?ms)^        val allLibs = buildList \{\n.*?^\s*\}\.distinct\(\)'
+          order_replacement = '''        val allLibs = buildList {
+                      add("libc++_shared.so")
+                      add("libpairipcore.so")
+                      add("libPlayFabMultiplayer.so")
+                      add("libmaesdk.so")
+                      requiredLibs.filterNot { it == "libc++_shared.so" || it == "libminecraftpe.so" }.forEach { add(it) }
+                      optionalLibs.forEach { add(it) }
+                      add("libminecraftpe.so")
+                      systemLoadedLibs.filterNot {
+                          it == "libpairipcore.so" || it == "libPlayFabMultiplayer.so" || it == "libmaesdk.so"
+                      }.forEach { add(it) }
+                  }.distinct()'''
+          s, n = re.subn(order_pattern, order_replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'Expected one allLibs order block; found {n}.')
+
+          # Use a child DexClassLoader whose parent is Minecraft's installed loader.
+          # This makes FindClass/JNI_OnLoad see Minecraft's PairIP Java classes while
+          # all extracted native libraries share a linker namespace and search path.
+          for import_line, anchor in [
+              ('import dalvik.system.DexClassLoader\n', 'import android.util.Log\n'),
+              ('import java.lang.reflect.InvocationTargetException\n', 'import java.io.InputStream\n'),
+          ]:
+              if import_line.strip() not in s:
+                  if anchor not in s:
+                      raise SystemExit(f'Import anchor not found: {anchor.strip()}')
+                  s = s.replace(anchor, anchor + import_line, 1)
+
+          field_anchor = '    private val applicationInfo: ApplicationInfo\n'
+          fields = '''    private val applicationInfo: ApplicationInfo
+          @Volatile private var runtimeNativeLoadMethod: java.lang.reflect.Method? = null
+          @Volatile private var runtimeNativeClassLoader: ClassLoader? = null
+          private val runtimeNativeLoaderLock = Any()
+          '''.rstrip('\n')
+          if 'runtimeNativeLoadMethod' not in s:
+              if field_anchor not in s:
+                  raise SystemExit('applicationInfo field anchor not found.')
+              s = s.replace(field_anchor, fields + '\n', 1)
+
+          method_anchor = '    private fun setupSecurityProvider() {\n'
+          method = '''    private fun loadRuntimeNativeLibrary(file: File) {
+                  if (!file.isFile || file.length() == 0L) {
+                      throw UnsatisfiedLinkError("Native library is missing or empty: ${file.absolutePath}")
+                  }
+                  val method = synchronized(runtimeNativeLoaderLock) {
+                      runtimeNativeLoadMethod ?: run {
+                          val optimizedDir = File(context.codeCacheDir, "runtime-native-loader-optimized")
+                          if (!optimizedDir.isDirectory && !optimizedDir.mkdirs()) {
+                              throw UnsatisfiedLinkError("Cannot create runtime loader cache: ${optimizedDir.absolutePath}")
+                          }
+                          val dexFile = File(context.codeCacheDir, "runtime-native-loader.dex")
+                          val temporaryDex = File(context.codeCacheDir, "runtime-native-loader.dex.tmp")
+                          try {
+                              context.assets.open("runtime-native-loader.dex").use { input ->
+                                  FileOutputStream(temporaryDex).use { output ->
+                                      input.copyTo(output)
+                                      output.fd.sync()
+                                  }
+                              }
+                              if (dexFile.exists() && !dexFile.delete()) {
+                                  throw UnsatisfiedLinkError("Cannot replace stale runtime-loader DEX: ${dexFile.absolutePath}")
+                              }
+                              if (!temporaryDex.renameTo(dexFile)) {
+                                  throw UnsatisfiedLinkError("Cannot install standalone runtime-loader DEX: ${dexFile.absolutePath}")
+                              }
+                          } catch (e: Exception) {
+                              temporaryDex.delete()
+                              throw UnsatisfiedLinkError("Cannot prepare standalone runtime-loader DEX: ${e.message ?: e.javaClass.simpleName}").also { it.initCause(e) }
+                          }
+                          val librarySearchPath = listOf(
+                              nativeLibDir,
+                              context.applicationInfo.nativeLibraryDir,
+                              packageContext.applicationInfo.nativeLibraryDir
+                          ).filter { it.isNotBlank() && File(it).isDirectory }
+                              .distinct()
+                              .joinToString(File.pathSeparator)
+                          if (librarySearchPath.isBlank()) {
+                              throw UnsatisfiedLinkError("No native library search directories are available")
+                          }
+                          val loader = DexClassLoader(
+                              dexFile.absolutePath,
+                              optimizedDir.absolutePath,
+                              librarySearchPath,
+                              packageContext.classLoader
+                          )
+                          val helper = Class.forName(
+                              "org.levimc.launcher.util.RuntimeNativeLoader",
+                              true,
+                              loader
+                          )
+                          val loadMethod = helper.getMethod("load", String::class.java)
+                          runtimeNativeClassLoader = loader
+                          runtimeNativeLoadMethod = loadMethod
+                          loadMethod
+                      }
+                  }
+                  try {
+                      method.invoke(null, file.absolutePath)
+                  } catch (e: InvocationTargetException) {
+                      val cause = e.targetException
+                      if (cause is UnsatisfiedLinkError) throw cause
+                      throw UnsatisfiedLinkError(
+                          "Game-parent classloader failed to load ${file.name}: ${cause.message ?: cause.javaClass.simpleName}"
+                      ).also { it.initCause(cause) }
+                  } catch (e: Exception) {
+                      throw UnsatisfiedLinkError(
+                          "Could not load ${file.name} through the game-parent classloader: ${e.message ?: e.javaClass.simpleName}"
+                      ).also { it.initCause(e) }
+                  }
+              }
+
+          '''
+          if 'private fun loadRuntimeNativeLibrary(file: File)' not in s:
+              if method_anchor not in s:
+                  raise SystemExit('setupSecurityProvider insertion point not found.')
+              s = s.replace(method_anchor, method + method_anchor, 1)
+
+          # Replace the provisional class-loader workaround. The previous workflow
+          # reported PairIP initialized without verifying that it was visible to the
+          # classloader actually loading libminecraftpe.so.
+          branch_pattern = re.compile(
+              r'(?ms)^([ \t]*)\} else if \(normalizedName == "pairipcore"\) \{\n'
+              r'.*?^\1\} else \{\n\1    System\.loadLibrary\(normalizedName\)\n\1\}'
+          )
+          branch_match = branch_pattern.search(s)
+          if branch_match:
+              i = branch_match.group(1)
+              branch = '\n'.join([
+                  i + '} else if (normalizedName == "pairipcore" || normalizedName == "PlayFabMultiplayer" || normalizedName == "maesdk") {',
+                  i + '    val dependency = File(nativeLibDir, fileName)',
+                  i + '    if (!dependency.isFile || dependency.length() == 0L) {',
+                  i + '        throw UnsatisfiedLinkError("Required runtime dependency was not extracted: ${dependency.absolutePath}")',
+                  i + '    }',
+                  i + '    ensureReadOnly(dependency)',
+                  i + '    loadRuntimeNativeLibrary(dependency)',
+                  i + '} else {',
+                  i + '    System.loadLibrary(normalizedName)',
+                  i + '}'
+              ])
+              s = s[:branch_match.start()] + branch + s[branch_match.end():]
+          elif 'normalizedName == "pairipcore" || normalizedName == "PlayFabMultiplayer" || normalizedName == "maesdk"' not in s:
+              raise SystemExit('Could not replace provisional PairIP/PlayFab/Mae load branch.')
+
+          # All regular extracted Minecraft libraries must be loaded by the same
+          # helper classloader too; otherwise PairIP would be invisible across linker namespaces.
+          if 'System.load(libFile.absolutePath)' in s:
+              s = s.replace('System.load(libFile.absolutePath)', 'loadRuntimeNativeLibrary(libFile)', 1)
+          elif 'loadRuntimeNativeLibrary(libFile)' not in s:
+              raise SystemExit('Could not route extracted libraries through the shared classloader.')
+
+          # Prevent any generic directory scan from ever rewriting PairIP as well.
+          guard_path = Path('app/src/main/java/org/levimc/launcher/util/NativeImageGuard.java')
+          guard = guard_path.read_text(encoding='utf-8')
+          should_marker = '    public static boolean shouldProcess(File soFile) {\n'
+          if should_marker not in guard:
+              raise SystemExit('NativeImageGuard.shouldProcess insertion point not found.')
+          if 'PairIP must remain byte-identical' not in guard:
+              guard = guard.replace(
+                  should_marker,
+                  should_marker +
+                  '        // PairIP must remain byte-identical; do not scan or rewrite this dependency.\n' +
+                  '        if (soFile != null && "libpairipcore.so".equals(soFile.getName())) return false;\n', 1)
+          process_marker = '    private static boolean process(File soFile, boolean ignoreMarker) {\n'
+          if process_marker not in guard:
+              raise SystemExit('NativeImageGuard.process insertion point not found.')
+          start = guard.index(process_marker) + len(process_marker)
+          invalid_guard = '''        if (soFile == null || !soFile.isFile() || soFile.length() == 0) {
+                      return false;
+                  }
+          '''
+          invalid_at = guard.find(invalid_guard, start)
+          if invalid_at < 0:
+              raise SystemExit('NativeImageGuard.process input validation block changed.')
+          after_invalid = invalid_at + len(invalid_guard)
+          if 'if ("libpairipcore.so".equals(soFile.getName()))' not in guard[after_invalid:after_invalid + 500]:
+              pairip_guard = '''        if ("libpairipcore.so".equals(soFile.getName())) {
+                      markClean(soFile);
+                      return true;
+                  }
+          '''
+              guard = guard[:after_invalid] + pairip_guard + guard[after_invalid:]
+          if 'PairIP must remain byte-identical' not in guard or 'markClean(soFile);' not in guard:
+              raise SystemExit('PairIP exclusion failed in NativeImageGuard.')
+          guard_path.write_text(guard, encoding='utf-8')
+
+          # Force one clean extraction after changing dependency membership and load namespace.
+          old_extractor = 'private const val EXTRACTOR_VERSION = 2'
+          new_extractor = 'private const val EXTRACTOR_VERSION = 3'
+          if old_extractor in s:
+              s = s.replace(old_extractor, new_extractor, 1)
+          elif new_extractor not in s:
+              raise SystemExit('Could not bump the native extraction cache version.')
+
+          # Confirm final state and save atomically only after every guard passes.
+          checks = [
+              '"libpairipcore.so"',
+              'PairIP bytes must stay original',
+              'DexClassLoader(',
+              'Class.forName(',
+              'loadRuntimeNativeLibrary(dependency)',
+              'loadRuntimeNativeLibrary(libFile)',
+              'optionalLibs.forEach { add(it) }',
+          ]
+          missing = [item for item in checks if item not in s]
+          if missing:
+              raise SystemExit('Final native loader checks failed: ' + ', '.join(missing))
+          path.write_text(s, encoding='utf-8')
+          print('Patched one Minecraft-parent DexClassLoader for PairIP, PlayFab, Mae, and the game libraries; standalone DEX is built after SDK setup.')
+          PY
+
+          grep -q 'private fun loadRuntimeNativeLibrary(file: File)' app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
+          grep -q 'loadRuntimeNativeLibrary(libFile)' app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
+          grep -q 'libpairipcore.so' app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
+
       - name: Ensure the deliberate CMake blocker is absent
         working-directory: source
         shell: bash
@@ -661,6 +885,32 @@ jobs:
             'build-tools;36.0.0' \
             'ndk;28.2.13676358' \
             'cmake;3.22.1'
+
+      - name: Compile standalone DEX entrypoint for the game-parent native loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/runtime-native-loader"
+          mkdir -p "$WORK/src/org/levimc/launcher/util" "$WORK/classes" "$WORK/dex"
+          cat > "$WORK/src/org/levimc/launcher/util/RuntimeNativeLoader.java" <<'JAVA'
+          package org.levimc.launcher.util;
+          public final class RuntimeNativeLoader {
+              private RuntimeNativeLoader() { }
+              public static void load(String absolutePath) {
+                  System.load(absolutePath);
+              }
+          }
+          JAVA
+          javac --release 8 -d "$WORK/classes" "$WORK/src/org/levimc/launcher/util/RuntimeNativeLoader.java"
+          "$ANDROID_HOME/build-tools/36.0.0/d8" \
+            --min-api 28 \
+            --lib "$ANDROID_HOME/platforms/android-36/android.jar" \
+            --output "$WORK/dex" \
+            "$WORK/classes/org/levimc/launcher/util/RuntimeNativeLoader.class"
+          test -s "$WORK/dex/classes.dex"
+          mkdir -p source/app/src/main/assets
+          install -m 0644 "$WORK/dex/classes.dex" source/app/src/main/assets/runtime-native-loader.dex
+          sha256sum source/app/src/main/assets/runtime-native-loader.dex
 
       - name: Build debug APK for ARMv7 and capture all output
         id: build
@@ -712,8 +962,8 @@ jobs:
           test -s "$APK"
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | tee /tmp/apk-badging.txt
           grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt
-          cp "$APK" 'LeviLauncher-ARMv7-PAIRIP-LAUNCHERLOADER-debug-v5.apk'
-          python3 - 'LeviLauncher-ARMv7-PAIRIP-LAUNCHERLOADER-debug-v5.apk' 'source/app/src/main/jniLibs/armeabi-v7a/libpairipcore.so' <<'PY'
+          cp "$APK" 'LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk'
+          python3 - 'LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk' 'source/app/src/main/jniLibs/armeabi-v7a/libpairipcore.so' <<'PY'
           import sys, zipfile, pathlib
           apk = sys.argv[1]
           expected_pairip = pathlib.Path(sys.argv[2]).read_bytes()
@@ -721,6 +971,7 @@ jobs:
               'lib/armeabi-v7a/libgxcore.so',
               'lib/armeabi-v7a/libc++_shared.so',
               'lib/armeabi-v7a/libpairipcore.so',
+              'assets/runtime-native-loader.dex',
           }
           with zipfile.ZipFile(apk) as z:
               names = set(z.namelist())
@@ -741,20 +992,18 @@ jobs:
               ):
                   if symbol not in so:
                       raise SystemExit('Missing shim JNI symbol: ' + symbol.decode())
-          with zipfile.ZipFile(apk) as z2:
-              dex_blobs = [z2.read(n) for n in z2.namelist() if n.startswith('classes') and n.endswith('.dex')]
-          if not any(b'Lcom/pairip/VMRunner;' in d and b'executeVM' in d for d in dex_blobs):
-              raise SystemExit('PairIP VMRunner shim (with executeVM) is missing from the APK dex files')
-          print('Verified com.pairip.VMRunner shim with executeVM is packaged')
-          print('Verified ARMv7 gxcore, libc++ and byte-identical libpairipcore.so in', apk)
+          loader_dex = z.read('assets/runtime-native-loader.dex')
+          if not loader_dex.startswith(b'dex\n') or len(loader_dex) < 100:
+              raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')
+          print('Verified ARMv7 gxcore, libc++, byte-identical PairIP, and runtime-loader DEX in', apk)
           PY
-          sha256sum 'LeviLauncher-ARMv7-PAIRIP-LAUNCHERLOADER-debug-v5.apk'
+          sha256sum 'LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk'
 
       - name: Upload installable APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: LeviLauncher-ARMv7-PAIRIP-LAUNCHERLOADER-debug-APK-v5
-          path: LeviLauncher-ARMv7-PAIRIP-LAUNCHERLOADER-debug-v5.apk
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk
           if-no-files-found: error
           retention-days: 7
