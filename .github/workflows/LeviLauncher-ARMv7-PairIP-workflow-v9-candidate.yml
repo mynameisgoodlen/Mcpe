@@ -1,0 +1,286 @@
+name: Build LeviLauncher ARMv7 standard-load-order APK v9 candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: main
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Fetch pinned build recipe and run v9 standard-load-order candidate
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          TEMPLATE="$RUNNER_TEMP/LeviLauncher-ARMv7-PairIP-workflow-v5-template.yml"
+          URL="https://raw.githubusercontent.com/mynameisgoodlen/Mcpe/${TEMPLATE_COMMIT}/.github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v5.yml"
+          curl --fail --silent --show-error --location "$URL" --retry 3 --retry-delay 2 -o "$TEMPLATE"
+          test -s "$TEMPLATE"
+          echo "Pinned recipe downloaded: $(wc -c < "$TEMPLATE") bytes"
+          python3 - "$TEMPLATE" <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          template_path = Path(sys.argv[1])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+          jobs = document.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected one job in pinned recipe; got {len(jobs)}")
+          steps = next(iter(jobs.values())).get("steps", [])
+          if not steps:
+              raise SystemExit("Pinned build recipe has no steps")
+
+          # v9 candidate: retain upstream native load order; omit custom preloading.
+          skip_step_names = {
+              "Prepare PairIP ordering before the final runtime-loader patch",
+              "Extract and preload PlayFab and Mae dependencies before Minecraft",
+              "Load the Minecraft native dependency chain with a shared game-parent classloader",
+              "Compile standalone DEX entrypoint for the game-parent native loader",
+          }
+          skipped_names = set()
+          recipe_run_steps = []
+          for step in steps:
+              # Checkout/setup/upload actions are declared as real actions in this
+              # wrapper workflow. Only replay shell steps from the pinned recipe.
+              if "run" not in step:
+                  continue
+              name = str(step.get("name", "unnamed recipe step"))
+              if name in skip_step_names:
+                  skipped_names.add(name)
+                  print(f"::notice::v9 candidate intentionally skips workaround step: {name}")
+                  continue
+              script = step["run"]
+
+              # The v5 verifier requires a DEX only because its paired custom loader
+              # is installed by the skipped steps. Remove that requirement as well.
+              if name == "Verify the APK targets ARMv7":
+                  script = script.replace("    'assets/runtime-native-loader.dex',\n", "")
+                  dex_start = script.find("loader_dex = z.read('assets/runtime-native-loader.dex')")
+                  if dex_start >= 0:
+                      print_at = script.find("print('Verified ARMv7 gxcore, libc++, byte-identical PairIP, and runtime-loader DEX in', apk)", dex_start)
+                      if print_at < 0:
+                          raise SystemExit("Could not safely remove the old runtime-loader DEX verifier")
+                      line_start = script.rfind("\n", 0, dex_start) + 1
+                      line_end = script.find("\n", print_at)
+                      if line_end < 0:
+                          line_end = len(script)
+                      script = script[:line_start] + "print('Verified ARMv7 gxcore, libc++, and byte-identical PairIP in', apk)" + script[line_end:]
+                  elif "runtime-loader DEX in" in script:
+                      raise SystemExit("Old DEX verifier appears partially changed; refusing to build")
+
+              # Version outputs produced by the pinned recipe.
+              script = script.replace(
+                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v9-candidate"
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk",
+                  "LeviLauncher-ARMv7-standard-load-order-debug-v9-candidate.apk",
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5",
+                  "LeviLauncher-ARMv7-standard-load-order-debug-APK-v9-candidate",
+              )
+              recipe_run_steps.append((step, script))
+
+          if skipped_names != skip_step_names:
+              raise SystemExit("Expected exactly four native-loader/DEX workaround steps to be skipped; found: " + repr(sorted(skipped_names)))
+
+          # Confirm the untouched build recipe still contains the core build stages.
+          required_recipe_markers = (
+              "PAIRIP_B64_00",
+              "Bundle compressed ARMv7 PairIP dependency",
+              "Verify the APK targets ARMv7",
+          )
+          original_text = template_path.read_text(encoding="utf-8")
+          missing = [marker for marker in required_recipe_markers if marker not in original_text]
+          if missing:
+              raise SystemExit("Pinned recipe is missing required sections: " + ", ".join(missing))
+
+          any_failed = False
+          build_failed = False
+          run_count = 0
+
+          def condition_allows(step):
+              condition = str(step.get("if", "")).strip()
+              if "always()" in condition:
+                  return True
+              if "failure()" in condition or "steps.build.outcome == 'failure'" in condition:
+                  return any_failed or build_failed
+              if "success()" in condition:
+                  return not any_failed
+              return not any_failed
+
+          def prebuild_checks():
+              manager = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              guard = workspace / "source/app/src/main/java/org/levimc/launcher/util/NativeImageGuard.java"
+              cmake = workspace / "source/app/src/main/cpp/CMakeLists.txt"
+              for f in (manager, guard, cmake):
+                  if not f.is_file():
+                      raise SystemExit(f"Required source file missing before build: {f}")
+
+              kotlin = manager.read_text(encoding="utf-8")
+              if any(x in kotlin for x in ("private fun loadRuntimeNativeLibrary(file: File)", "runtimeDependencyLibs", "initializeOfficialPairIp()")):
+                  raise SystemExit("A custom native preloader remains in source; refusing to build v9 candidate")
+              if "val allLibs = requiredLibs + systemLoadedLibs" not in kotlin:
+                  raise SystemExit("Expected original upstream native library order is not present")
+              if '"libPlayFabMultiplayer.so"' not in kotlin or '"libmaesdk.so"' not in kotlin:
+                  raise SystemExit("Expected upstream PlayFab/Mae entries are missing")
+
+              # Do not pass PairIP through the launcher-specific image transformer.
+              method_marker = "    private fun processNativeImage(file: File, force: Boolean = false): Boolean {\n"
+              if method_marker not in kotlin:
+                  raise SystemExit("GamePackageManager.processNativeImage changed; refusing to patch")
+              pairip_guard = '        // PairIP must remain byte-identical; avoid generic image scanning/rewrite.\n        if (file.name == "libpairipcore.so") return true\n'
+              if "PairIP must remain byte-identical" not in kotlin:
+                  kotlin = kotlin.replace(method_marker, method_marker + pairip_guard, 1)
+              old_version = "private const val EXTRACTOR_VERSION = 2"
+              new_version = "private const val EXTRACTOR_VERSION = 3"
+              if old_version in kotlin:
+                  kotlin = kotlin.replace(old_version, new_version, 1)
+              elif new_version not in kotlin:
+                  raise SystemExit("Could not safely invalidate the old native extraction cache")
+              manager.write_text(kotlin, encoding="utf-8")
+
+              guard_text = guard.read_text(encoding="utf-8")
+              should_marker = "    public static boolean shouldProcess(File soFile) {\n"
+              if should_marker not in guard_text:
+                  raise SystemExit("NativeImageGuard.shouldProcess insertion point changed")
+              if "PairIP must remain byte-identical" not in guard_text:
+                  guard_text = guard_text.replace(
+                      should_marker,
+                      should_marker +
+                      "        // PairIP must remain byte-identical; do not scan or rewrite it.\n" +
+                      '        if (soFile != null && "libpairipcore.so".equals(soFile.getName())) return false;\n',
+                      1,
+                  )
+
+              process_marker = "    private static boolean process(File soFile, boolean ignoreMarker) {\n"
+              if process_marker not in guard_text:
+                  raise SystemExit("NativeImageGuard.process insertion point changed")
+              process_start = guard_text.index(process_marker) + len(process_marker)
+              invalid_guard = "        if (soFile == null || !soFile.isFile() || soFile.length() == 0) {\n            return false;\n        }\n"
+              invalid_at = guard_text.find(invalid_guard, process_start)
+              if invalid_at < 0:
+                  raise SystemExit("NativeImageGuard input-validation block changed; refusing to guess")
+              after_invalid = invalid_at + len(invalid_guard)
+              if 'if ("libpairipcore.so".equals(soFile.getName()))' not in guard_text[after_invalid:after_invalid + 500]:
+                  pairip_process_guard = '        if ("libpairipcore.so".equals(soFile.getName())) {\n            markClean(soFile);\n            return true;\n        }\n'
+                  guard_text = guard_text[:after_invalid] + pairip_process_guard + guard_text[after_invalid:]
+              guard.write_text(guard_text, encoding="utf-8")
+
+              cmake_text = cmake.read_text(encoding="utf-8")
+              if "ARMV7_REQUIRE_REAL_GXCORE" in cmake_text or "ARMV7_GXCORE_COMPAT_SHIM" not in cmake_text:
+                  raise SystemExit("ARMv7 gxcore compatibility shim checks failed")
+              if 'if (soFile != null && "libpairipcore.so".equals(soFile.getName())) return false;' not in guard_text:
+                  raise SystemExit("PairIP generic rewrite exclusion failed")
+              if "PairIP must remain byte-identical" not in kotlin or new_version not in kotlin:
+                  raise SystemExit("PairIP byte-preservation/cache invalidation checks failed")
+              print("Pre-build checks passed: upstream load order retained, custom preloader omitted, PairIP protected, ARMv7 shim present.")
+
+          for step, script in recipe_run_steps:
+              name = str(step.get("name", "unnamed recipe step"))
+              step_id = str(step.get("id", ""))
+              if not condition_allows(step):
+                  print(f"::notice::Skipping recipe step after prior failure: {name}")
+                  continue
+
+              if step_id == "build":
+                  prebuild_checks()
+
+              working = step.get("working-directory", ".")
+              working = str(working).replace("$" + "{{ github.workspace }}", str(workspace))
+              cwd = Path(working)
+              if not cwd.is_absolute():
+                  cwd = workspace / cwd
+              if not cwd.is_dir():
+                  raise SystemExit(f"Working directory missing for '{name}': {cwd}")
+
+              # GitHub expressions are normally expanded by Actions before a shell
+              # step begins. These translations preserve the supported expressions
+              # used by the pinned shell recipe.
+              script = script.replace("$" + "{{ runner.temp }}", os.environ.get("RUNNER_TEMP", "/tmp"))
+              script = script.replace("$" + "{{ github.workspace }}", str(workspace))
+              if ("$" + "{{") in script:
+                  raise SystemExit(f"Unsupported GitHub expression left in recipe step: {name}")
+
+              child_env = os.environ.copy()
+              for key, value in (step.get("env") or {}).items():
+                  child_env[str(key)] = str(value)
+
+              print(f"\n::group::v9 candidate recipe step: {name}")
+              run_count += 1
+              result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=cwd, env=child_env)
+              print(f"::endgroup::")
+              if result.returncode != 0:
+                  print(f"::error::Recipe step failed ({result.returncode}): {name}")
+                  any_failed = True
+                  if step_id == "build":
+                      build_failed = True
+
+          if run_count < 7:
+              raise SystemExit(f"Too few shell steps were executed ({run_count}); refusing to call this build complete")
+          if any_failed:
+              raise SystemExit("One or more v9 candidate build steps failed; see the log above and the uploaded build-log artifact.")
+          print("All replayed v9 candidate build and APK-verification steps completed successfully.")
+          PY
+
+      - name: Upload full build log for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v9-candidate
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload installable ARMv7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-standard-load-order-debug-APK-v9-candidate
+          path: LeviLauncher-ARMv7-standard-load-order-debug-v9-candidate.apk
+          if-no-files-found: error
+          retention-days: 7
