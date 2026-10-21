@@ -178,8 +178,25 @@ jobs:
               ):
                   if marker not in kotlin:
                       raise SystemExit("Shared native loader is incomplete; missing: " + marker)
-              if 'normalizedName == "pairipcore" || normalizedName == "PlayFabMultiplayer" || normalizedName == "maesdk"' not in kotlin:
-                  raise SystemExit("PairIP/PlayFab/Mae are not routed through the shared class-loader path")
+              # The safe path intentionally has TWO branches: PairIP is initialized
+              # through Minecraft's own package classloader, while PlayFab/Mae use the
+              # shared DexClassLoader. Do not require a single combined if-expression.
+              pairip_route = re.search(
+                  r'(?ms)^[ \t]*\}\s*else if \(normalizedName == "pairipcore"\) \{\n'
+                  r'(?P<body>.*?)^[ \t]*\}\s*else if \(normalizedName == "PlayFabMultiplayer" \|\| normalizedName == "maesdk"\) \{',
+                  kotlin,
+              )
+              if not pairip_route or "initializeOfficialPairIp()" not in pairip_route.group("body") or "loadRuntimeNativeLibrary" in pairip_route.group("body"):
+                  raise SystemExit("PairIP must use the official Minecraft classloader, not the custom loader")
+              runtime_route = re.search(
+                  r'(?ms)^[ \t]*\}\s*else if \(normalizedName == "PlayFabMultiplayer" \|\| normalizedName == "maesdk"\) \{\n'
+                  r'(?P<body>.*?)^[ \t]*\}\s*else \{',
+                  kotlin,
+              )
+              if not runtime_route or "loadRuntimeNativeLibrary(dependency)" not in runtime_route.group("body"):
+                  raise SystemExit("PlayFab/Mae must use the shared DexClassLoader and extracted library path")
+              if "System.loadLibrary(normalizedName)" in runtime_route.group("body"):
+                  raise SystemExit("PlayFab/Mae still bypass the shared native loader")
 
               # Fix the regression seen in v8: PlayFab/Mae were explicitly loaded
               # before libminecraftpe.so, and libPlayFabMultiplayer.so crashed in
