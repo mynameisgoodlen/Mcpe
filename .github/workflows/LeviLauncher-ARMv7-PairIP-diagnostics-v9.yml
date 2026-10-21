@@ -1,0 +1,308 @@
+name: Build LeviLauncher ARMv7 PairIP diagnostics v9 (no load-order change)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: main
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Fetch pinned build recipe and run v9 diagnostic build
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          TEMPLATE="$RUNNER_TEMP/LeviLauncher-ARMv7-PairIP-workflow-v5-template.yml"
+          URL="https://raw.githubusercontent.com/mynameisgoodlen/Mcpe/${TEMPLATE_COMMIT}/.github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v5.yml"
+          curl --fail --silent --show-error --location "$URL" --retry 3 --retry-delay 2 -o "$TEMPLATE"
+          test -s "$TEMPLATE"
+          echo "Pinned recipe downloaded: $(wc -c < "$TEMPLATE") bytes"
+          python3 - "$TEMPLATE" <<'PY'
+          import base64
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          native_loader_source = base64.b64decode("cGFja2FnZSBvcmcubGV2aW1jLmxhdW5jaGVyLnV0aWw7CmltcG9ydCBhbmRyb2lkLnV0aWwuTG9nOwppbXBvcnQgamF2YS5pby5CdWZmZXJlZFJlYWRlcjsKaW1wb3J0IGphdmEuaW8uRmlsZTsKaW1wb3J0IGphdmEuaW8uRmlsZUlucHV0U3RyZWFtOwppbXBvcnQgamF2YS5pby5GaWxlT3V0cHV0U3RyZWFtOwppbXBvcnQgamF2YS5pby5JbnB1dFN0cmVhbVJlYWRlcjsKaW1wb3J0IGphdmEuc2VjdXJpdHkuTWVzc2FnZURpZ2VzdDsKcHVibGljIGZpbmFsIGNsYXNzIFJ1bnRpbWVOYXRpdmVMb2FkZXIgewogICAgcHJpdmF0ZSBzdGF0aWMgZmluYWwgU3RyaW5nIFRBRyA9ICJQYWlySVBEaWFnVjkiOwogICAgcHJpdmF0ZSBzdGF0aWMgdm9sYXRpbGUgU3RyaW5nIGRpYWdub3N0aWNMb2dQYXRoOwogICAgcHJpdmF0ZSBSdW50aW1lTmF0aXZlTG9hZGVyKCkgeyB9CiAgICBwcml2YXRlIHN0YXRpYyB2b2lkIHdyaXRlRmlsZUxvZyhTdHJpbmcgbWVzc2FnZSkgewogICAgICAgIFN0cmluZyBwYXRoID0gZGlhZ25vc3RpY0xvZ1BhdGg7CiAgICAgICAgaWYgKHBhdGggPT0gbnVsbCB8fCBwYXRoLmxlbmd0aCgpID09IDApIHJldHVybjsKICAgICAgICB0cnkgewogICAgICAgICAgICBGaWxlIGZpbGUgPSBuZXcgRmlsZShwYXRoKTsKICAgICAgICAgICAgRmlsZSBwYXJlbnQgPSBmaWxlLmdldFBhcmVudEZpbGUoKTsKICAgICAgICAgICAgaWYgKHBhcmVudCAhPSBudWxsICYmICFwYXJlbnQuaXNEaXJlY3RvcnkoKSkgcGFyZW50Lm1rZGlycygpOwogICAgICAgICAgICBzeW5jaHJvbml6ZWQgKFJ1bnRpbWVOYXRpdmVMb2FkZXIuY2xhc3MpIHsKICAgICAgICAgICAgICAgIHRyeSAoRmlsZU91dHB1dFN0cmVhbSBvdXQgPSBuZXcgRmlsZU91dHB1dFN0cmVhbShmaWxlLCB0cnVlKSkgewogICAgICAgICAgICAgICAgICAgIG91dC53cml0ZSgoU3lzdGVtLmN1cnJlbnRUaW1lTWlsbGlzKCkgKyAiICIgKyBtZXNzYWdlICsgIlxuIikuZ2V0Qnl0ZXMoIlVURi04IikpOwogICAgICAgICAgICAgICAgICAgIG91dC5mbHVzaCgpOwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9CiAgICAgICAgfSBjYXRjaCAoVGhyb3dhYmxlIGlnbm9yZWQpIHsgfQogICAgfQogICAgcHJpdmF0ZSBzdGF0aWMgdm9pZCBsb2coU3RyaW5nIG1lc3NhZ2UpIHsKICAgICAgICBMb2cuZShUQUcsIG1lc3NhZ2UpOwogICAgICAgIHdyaXRlRmlsZUxvZyhtZXNzYWdlKTsKICAgIH0KICAgIHByaXZhdGUgc3RhdGljIHZvaWQgbG9nKFN0cmluZyBtZXNzYWdlLCBUaHJvd2FibGUgZXJyb3IpIHsKICAgICAgICBMb2cuZShUQUcsIG1lc3NhZ2UsIGVycm9yKTsKICAgICAgICB3cml0ZUZpbGVMb2cobWVzc2FnZSArICIgZXhjZXB0aW9uPSIgKyBlcnJvcik7CiAgICB9CiAgICBwcml2YXRlIHN0YXRpYyBTdHJpbmcgbG9hZGVyTmFtZShDbGFzc0xvYWRlciBsb2FkZXIpIHsKICAgICAgICByZXR1cm4gbG9hZGVyID09IG51bGwgPyAiYm9vdHN0cmFwIiA6IGxvYWRlci5nZXRDbGFzcygpLmdldE5hbWUoKSArICJAIiArIEludGVnZXIudG9IZXhTdHJpbmcoU3lzdGVtLmlkZW50aXR5SGFzaENvZGUobG9hZGVyKSk7CiAgICB9CiAgICBwcml2YXRlIHN0YXRpYyB2b2lkIGR1bXBGaWxlKFN0cmluZyBsYWJlbCwgU3RyaW5nIHBhdGgpIHsKICAgICAgICB0cnkgewogICAgICAgICAgICBpZiAocGF0aCA9PSBudWxsIHx8IHBhdGgubGVuZ3RoKCkgPT0gMCkgewogICAgICAgICAgICAgICAgbG9nKCJQQUlSSVBESUFHIGZpbGU9IiArIGxhYmVsICsgIiBwYXRoPTxlbXB0eT4iKTsKICAgICAgICAgICAgICAgIHJldHVybjsKICAgICAgICAgICAgfQogICAgICAgICAgICBGaWxlIGYgPSBuZXcgRmlsZShwYXRoKTsKICAgICAgICAgICAgaWYgKCFmLmlzRmlsZSgpKSB7CiAgICAgICAgICAgICAgICBsb2coIlBBSVJJUERJQUcgZmlsZT0iICsgbGFiZWwgKyAiIGV4aXN0cz1mYWxzZSBwYXRoPSIgKyBwYXRoKTsKICAgICAgICAgICAgICAgIHJldHVybjsKICAgICAgICAgICAgfQogICAgICAgICAgICBNZXNzYWdlRGlnZXN0IG1kID0gTWVzc2FnZURpZ2VzdC5nZXRJbnN0YW5jZSgiTUQ1Iik7CiAgICAgICAgICAgIHRyeSAoRmlsZUlucHV0U3RyZWFtIGluID0gbmV3IEZpbGVJbnB1dFN0cmVhbShmKSkgewogICAgICAgICAgICAgICAgYnl0ZVtdIGJ1ZiA9IG5ldyBieXRlWzgxOTJdOwogICAgICAgICAgICAgICAgaW50IG47CiAgICAgICAgICAgICAgICB3aGlsZSAoKG4gPSBpbi5yZWFkKGJ1ZikpID49IDApIGlmIChuID4gMCkgbWQudXBkYXRlKGJ1ZiwgMCwgbik7CiAgICAgICAgICAgIH0KICAgICAgICAgICAgU3RyaW5nQnVpbGRlciBoZXggPSBuZXcgU3RyaW5nQnVpbGRlcigpOwogICAgICAgICAgICBmb3IgKGJ5dGUgYiA6IG1kLmRpZ2VzdCgpKSBoZXguYXBwZW5kKFN0cmluZy5mb3JtYXQoamF2YS51dGlsLkxvY2FsZS5ST09ULCAiJTAyeCIsIGIgJiAweGZmKSk7CiAgICAgICAgICAgIGxvZygiUEFJUklQRElBRyBmaWxlPSIgKyBsYWJlbCArICIgZXhpc3RzPXRydWUgc2l6ZT0iICsgZi5sZW5ndGgoKSArICIgbWQ1PSIgKyBoZXggKyAiIHBhdGg9IiArIGYuZ2V0QWJzb2x1dGVQYXRoKCkpOwogICAgICAgIH0gY2F0Y2ggKFRocm93YWJsZSB0KSB7CiAgICAgICAgICAgIGxvZygiUEFJUklQRElBRyBmaWxlLWhhc2gtZmFpbGVkIGxhYmVsPSIgKyBsYWJlbCArICIgcGF0aD0iICsgcGF0aCArICIgZXJyb3I9IiArIHQsIHQpOwogICAgICAgIH0KICAgIH0KICAgIHByaXZhdGUgc3RhdGljIHZvaWQgZHVtcE1hcHMoU3RyaW5nIHN0YWdlKSB7CiAgICAgICAgYm9vbGVhbiBmb3VuZCA9IGZhbHNlOwogICAgICAgIHRyeSAoQnVmZmVyZWRSZWFkZXIgcmVhZGVyID0gbmV3IEJ1ZmZlcmVkUmVhZGVyKG5ldyBJbnB1dFN0cmVhbVJlYWRlcihuZXcgRmlsZUlucHV0U3RyZWFtKCIvcHJvYy9zZWxmL21hcHMiKSkpKSB7CiAgICAgICAgICAgIFN0cmluZyBsaW5lOwogICAgICAgICAgICB3aGlsZSAoKGxpbmUgPSByZWFkZXIucmVhZExpbmUoKSkgIT0gbnVsbCkgewogICAgICAgICAgICAgICAgaWYgKGxpbmUudG9Mb3dlckNhc2UoamF2YS51dGlsLkxvY2FsZS5ST09UKS5jb250YWlucygicGFpcmlwIikpIHsKICAgICAgICAgICAgICAgICAgICBmb3VuZCA9IHRydWU7CiAgICAgICAgICAgICAgICAgICAgbG9nKCJQQUlSSVBESUFHIG1hcHMgc3RhZ2U9IiArIHN0YWdlICsgIiAiICsgbGluZSk7CiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICAgICAgaWYgKCFmb3VuZCkgbG9nKCJQQUlSSVBESUFHIG1hcHMgc3RhZ2U9IiArIHN0YWdlICsgIiBubyBwYWlyaXAgbWFwcGluZ3MiKTsKICAgICAgICB9IGNhdGNoIChUaHJvd2FibGUgdCkgewogICAgICAgICAgICBsb2coIlBBSVJJUERJQUcgbWFwcy1mYWlsZWQgc3RhZ2U9IiArIHN0YWdlICsgIiBlcnJvcj0iICsgdCwgdCk7CiAgICAgICAgfQogICAgfQogICAgcHJpdmF0ZSBzdGF0aWMgdm9pZCBzbmFwc2hvdChTdHJpbmcgc3RhZ2UsIFN0cmluZyBpbnN0YWxsZWRQYXRoLCBTdHJpbmcgbGF1bmNoZXJQYXRoLCBTdHJpbmcgZXh0cmFjdGVkUGF0aCkgewogICAgICAgIFRocmVhZCB0aHJlYWQgPSBUaHJlYWQuY3VycmVudFRocmVhZCgpOwogICAgICAgIGxvZygiUEFJUklQRElBRyBzdGFnZT0iICsgc3RhZ2UgKyAiIHRocmVhZD0iICsgdGhyZWFkLmdldE5hbWUoKSArICIgaGVscGVyTG9hZGVyPSIgKyBsb2FkZXJOYW1lKFJ1bnRpbWVOYXRpdmVMb2FkZXIuY2xhc3MuZ2V0Q2xhc3NMb2FkZXIoKSkgKyAiIGNvbnRleHRMb2FkZXI9IiArIGxvYWRlck5hbWUodGhyZWFkLmdldENvbnRleHRDbGFzc0xvYWRlcigpKSk7CiAgICAgICAgZHVtcEZpbGUoImluc3RhbGxlZC1taW5lY3JhZnQtcGFpcmlwIiwgaW5zdGFsbGVkUGF0aCk7CiAgICAgICAgZHVtcEZpbGUoImxhdW5jaGVyLW5hdGl2ZS1wYWlyaXAiLCBsYXVuY2hlclBhdGgpOwogICAgICAgIGR1bXBGaWxlKCJleHRyYWN0ZWQtY2FjaGUtcGFpcmlwIiwgZXh0cmFjdGVkUGF0aCk7CiAgICAgICAgZHVtcE1hcHMoc3RhZ2UpOwogICAgfQogICAgcHVibGljIHN0YXRpYyB2b2lkIGxvYWQoU3RyaW5nIGFic29sdXRlUGF0aCwgU3RyaW5nIGluc3RhbGxlZFBhdGgsIFN0cmluZyBsYXVuY2hlclBhdGgsIFN0cmluZyBleHRyYWN0ZWRQYXRoLCBTdHJpbmcgbG9nUGF0aCkgewogICAgICAgIGRpYWdub3N0aWNMb2dQYXRoID0gbG9nUGF0aDsKICAgICAgICBTdHJpbmcgbGlicmFyeU5hbWUgPSBuZXcgRmlsZShhYnNvbHV0ZVBhdGgpLmdldE5hbWUoKTsKICAgICAgICBUaHJlYWQgdGhyZWFkID0gVGhyZWFkLmN1cnJlbnRUaHJlYWQoKTsKICAgICAgICBsb2coIlBBSVJJUERJQUcgc3lzdGVtTG9hZCB0YXJnZXQ9IiArIGFic29sdXRlUGF0aCArICIgdGhyZWFkPSIgKyB0aHJlYWQuZ2V0TmFtZSgpICsgIiBoZWxwZXJMb2FkZXI9IiArIGxvYWRlck5hbWUoUnVudGltZU5hdGl2ZUxvYWRlci5jbGFzcy5nZXRDbGFzc0xvYWRlcigpKSArICIgY29udGV4dExvYWRlcj0iICsgbG9hZGVyTmFtZSh0aHJlYWQuZ2V0Q29udGV4dENsYXNzTG9hZGVyKCkpKTsKICAgICAgICBib29sZWFuIGluc3BlY3QgPSAibGlicGFpcmlwY29yZS5zbyIuZXF1YWxzKGxpYnJhcnlOYW1lKQogICAgICAgICAgICAgICAgfHwgImxpYlBsYXlGYWJNdWx0aXBsYXllci5zbyIuZXF1YWxzKGxpYnJhcnlOYW1lKQogICAgICAgICAgICAgICAgfHwgImxpYm1hZXNkay5zbyIuZXF1YWxzKGxpYnJhcnlOYW1lKQogICAgICAgICAgICAgICAgfHwgImxpYm1pbmVjcmFmdHBlLnNvIi5lcXVhbHMobGlicmFyeU5hbWUpOwogICAgICAgIGlmIChpbnNwZWN0KSBzbmFwc2hvdCgiYmVmb3JlLVN5c3RlbS5sb2FkOiIgKyBsaWJyYXJ5TmFtZSwgaW5zdGFsbGVkUGF0aCwgbGF1bmNoZXJQYXRoLCBleHRyYWN0ZWRQYXRoKTsKICAgICAgICBTeXN0ZW0ubG9hZChhYnNvbHV0ZVBhdGgpOwogICAgICAgIGlmIChpbnNwZWN0KSBzbmFwc2hvdCgiYWZ0ZXItU3lzdGVtLmxvYWQ6IiArIGxpYnJhcnlOYW1lLCBpbnN0YWxsZWRQYXRoLCBsYXVuY2hlclBhdGgsIGV4dHJhY3RlZFBhdGgpOwogICAgfQp9").decode("utf-8")
+          diag_helper_source = base64.b64decode("ICAgIHByaXZhdGUgZnVuIHBhaXJJcERpYWdMb2cobWVzc2FnZTogU3RyaW5nLCBlcnJvcjogVGhyb3dhYmxlPyA9IG51bGwpIHsKICAgICAgICB0cnkgewogICAgICAgICAgICBpZiAoZXJyb3IgPT0gbnVsbCkgTG9nLmUoVEFHLCBtZXNzYWdlKSBlbHNlIExvZy5lKFRBRywgbWVzc2FnZSwgZXJyb3IpCiAgICAgICAgfSBjYXRjaCAoXzogVGhyb3dhYmxlKSB7IH0KICAgICAgICB0cnkgewogICAgICAgICAgICB2YWwgcm9vdCA9IGNvbnRleHQuZ2V0RXh0ZXJuYWxGaWxlc0RpcihudWxsKSA/OiBjb250ZXh0LmZpbGVzRGlyCiAgICAgICAgICAgIHZhbCBmaWxlID0gRmlsZShyb290LCAicGFpcmlwLWRpYWdub3N0aWNzLXY5LmxvZyIpCiAgICAgICAgICAgIGZpbGUucGFyZW50RmlsZT8ubWtkaXJzKCkKICAgICAgICAgICAgZmlsZS5hcHBlbmRUZXh0KG1lc3NhZ2UgKyAiXG4iLCBDaGFyc2V0cy5VVEZfOCkKICAgICAgICB9IGNhdGNoIChfOiBUaHJvd2FibGUpIHsgfQogICAgfQoKICAgIHByaXZhdGUgZnVuIHBhaXJJcERpYWdMb2FkZXJOYW1lKGxvYWRlcjogQ2xhc3NMb2FkZXI/KTogU3RyaW5nID0KICAgICAgICBpZiAobG9hZGVyID09IG51bGwpICJib290c3RyYXAiIGVsc2UgIiR7bG9hZGVyLmphdmFDbGFzcy5uYW1lfUAke1N5c3RlbS5pZGVudGl0eUhhc2hDb2RlKGxvYWRlcikudG9TdHJpbmcoMTYpfSIKCiAgICBwcml2YXRlIGZ1biBsb2dQYWlySXBEaWFnbm9zdGljcyhzdGFnZTogU3RyaW5nKSB7CiAgICAgICAgdHJ5IHsKICAgICAgICAgICAgdmFsIHRocmVhZCA9IFRocmVhZC5jdXJyZW50VGhyZWFkKCkKICAgICAgICAgICAgcGFpcklwRGlhZ0xvZygiUEFJUklQRElBRyBzdGFnZT0kc3RhZ2UgdGhyZWFkPSR7dGhyZWFkLm5hbWV9IGNvbnRleHRMb2FkZXI9JHtwYWlySXBEaWFnTG9hZGVyTmFtZSh0aHJlYWQuY29udGV4dENsYXNzTG9hZGVyKX0gcGFja2FnZUxvYWRlcj0ke3BhaXJJcERpYWdMb2FkZXJOYW1lKHBhY2thZ2VDb250ZXh0LmNsYXNzTG9hZGVyKX0gcnVudGltZUxvYWRlcj0ke3BhaXJJcERpYWdMb2FkZXJOYW1lKHJ1bnRpbWVOYXRpdmVDbGFzc0xvYWRlcil9IikKICAgICAgICAgICAgdmFsIGNhbmRpZGF0ZXMgPSBsaXN0T2YoCiAgICAgICAgICAgICAgICAiaW5zdGFsbGVkLW1pbmVjcmFmdC1wYWlyaXAiIHRvIEZpbGUocGFja2FnZUNvbnRleHQuYXBwbGljYXRpb25JbmZvLm5hdGl2ZUxpYnJhcnlEaXIsICJsaWJwYWlyaXBjb3JlLnNvIiksCiAgICAgICAgICAgICAgICAibGF1bmNoZXItbmF0aXZlLXBhaXJpcCIgdG8gRmlsZShjb250ZXh0LmFwcGxpY2F0aW9uSW5mby5uYXRpdmVMaWJyYXJ5RGlyLCAibGlicGFpcmlwY29yZS5zbyIpLAogICAgICAgICAgICAgICAgImV4dHJhY3RlZC1jYWNoZS1wYWlyaXAiIHRvIEZpbGUobmF0aXZlTGliRGlyLCAibGlicGFpcmlwY29yZS5zbyIpCiAgICAgICAgICAgICkKICAgICAgICAgICAgY2FuZGlkYXRlcy5mb3JFYWNoIHsgKGxhYmVsLCBmaWxlKSAtPgogICAgICAgICAgICAgICAgaWYgKCFmaWxlLmlzRmlsZSkgewogICAgICAgICAgICAgICAgICAgIHBhaXJJcERpYWdMb2coIlBBSVJJUERJQUcgZmlsZT0kbGFiZWwgZXhpc3RzPWZhbHNlIHBhdGg9JHtmaWxlLmFic29sdXRlUGF0aH0iKQogICAgICAgICAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgICAgICAgICB2YWwgZGlnZXN0ID0gamF2YS5zZWN1cml0eS5NZXNzYWdlRGlnZXN0LmdldEluc3RhbmNlKCJNRDUiKQogICAgICAgICAgICAgICAgICAgIGZpbGUuaW5wdXRTdHJlYW0oKS5idWZmZXJlZCgpLnVzZSB7IGlucHV0IC0+CiAgICAgICAgICAgICAgICAgICAgICAgIHZhbCBidWZmZXIgPSBCeXRlQXJyYXkoODE5MikKICAgICAgICAgICAgICAgICAgICAgICAgd2hpbGUgKHRydWUpIHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHZhbCBjb3VudCA9IGlucHV0LnJlYWQoYnVmZmVyKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgKGNvdW50IDwgMCkgYnJlYWsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIChjb3VudCA+IDApIGRpZ2VzdC51cGRhdGUoYnVmZmVyLCAwLCBjb3VudCkKICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICB2YWwgbWQ1ID0gZGlnZXN0LmRpZ2VzdCgpLmpvaW5Ub1N0cmluZygiIikgeyAiJTAyeCIuZm9ybWF0KGl0LnRvSW50KCkgYW5kIDB4ZmYpIH0KICAgICAgICAgICAgICAgICAgICBwYWlySXBEaWFnTG9nKCJQQUlSSVBESUFHIGZpbGU9JGxhYmVsIGV4aXN0cz10cnVlIHNpemU9JHtmaWxlLmxlbmd0aCgpfSBtZDU9JG1kNSBwYXRoPSR7ZmlsZS5hYnNvbHV0ZVBhdGh9IikKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgICAgICB2YXIgZm91bmQgPSBmYWxzZQogICAgICAgICAgICBGaWxlKCIvcHJvYy9zZWxmL21hcHMiKS51c2VMaW5lcyB7IHJvd3MgLT4KICAgICAgICAgICAgICAgIHJvd3MuZmlsdGVyIHsgaXQuY29udGFpbnMoInBhaXJpcCIsIGlnbm9yZUNhc2UgPSB0cnVlKSB9LmZvckVhY2ggeyBsaW5lIC0+CiAgICAgICAgICAgICAgICAgICAgZm91bmQgPSB0cnVlCiAgICAgICAgICAgICAgICAgICAgcGFpcklwRGlhZ0xvZygiUEFJUklQRElBRyBtYXBzIHN0YWdlPSRzdGFnZSAkbGluZSIpCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICAgICAgaWYgKCFmb3VuZCkgcGFpcklwRGlhZ0xvZygiUEFJUklQRElBRyBtYXBzIHN0YWdlPSRzdGFnZSBubyBwYWlyaXAgbWFwcGluZ3MiKQogICAgICAgIH0gY2F0Y2ggKHQ6IFRocm93YWJsZSkgewogICAgICAgICAgICBwYWlySXBEaWFnTG9nKCJQQUlSSVBESUFHIHNuYXBzaG90IGZhaWxlZCBzdGFnZT0kc3RhZ2UgZXJyb3I9JHt0Lm1lc3NhZ2UgPzogdC5qYXZhQ2xhc3Muc2ltcGxlTmFtZX0iLCB0KQogICAgICAgIH0KICAgIH0=").decode("utf-8")
+
+          template_path = Path(sys.argv[1])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+          jobs = document.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected one job in pinned recipe; got {len(jobs)}")
+          steps = next(iter(jobs.values())).get("steps", [])
+          if not steps:
+              raise SystemExit("Pinned build recipe has no steps")
+
+          # Fix the conflicting final patch: PairIP must use Minecraft's official
+          # package class loader; the custom runtime loader remains for PlayFab/Mae.
+          old_pairip_line = """i + '} else if (normalizedName == \"pairipcore\" || normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',"""
+          new_pairip_lines = """i + '} else if (normalizedName == \"pairipcore\") {',
+                  i + '    initializeOfficialPairIp()',
+                  i + '} else if (normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',"""
+
+          # Fix the ZIP verifier: read the DEX while the ZipFile is still open.
+          old_dex_check = (
+              "loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "    raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+          new_dex_check = (
+              "    loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "    if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "        raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+
+          recipe_run_steps = []
+          pairip_fix_count = 0
+          dex_fix_count = 0
+          for step in steps:
+              # Checkout/setup/upload actions are declared as real actions in this
+              # wrapper workflow. Only replay shell steps from the pinned recipe.
+              if "run" not in step:
+                  continue
+              script = step["run"]
+              step_name = str(step.get("name", "unnamed recipe step"))
+              if step_name == "Load the Minecraft native dependency chain with a shared game-parent classloader":
+                  old_get = 'val loadMethod = helper.getMethod("load", String::class.java)'
+                  new_get = 'val loadMethod = helper.getMethod("load", String::class.java, String::class.java, String::class.java, String::class.java, String::class.java)'
+                  if script.count(old_get) != 1:
+                      raise SystemExit("Could not safely instrument the native-loader reflection signature")
+                  script = script.replace(old_get, new_get, 1)
+                  old_invoke = '            method.invoke(null, file.absolutePath)'
+                  new_invoke = "\n".join([
+                      '            method.invoke(',
+                      '                null,',
+                      '                file.absolutePath,',
+                      '                File(packageContext.applicationInfo.nativeLibraryDir, "libpairipcore.so").absolutePath,',
+                      '                File(context.applicationInfo.nativeLibraryDir, "libpairipcore.so").absolutePath,',
+                      '                File(nativeLibDir, "libpairipcore.so").absolutePath,',
+                      '                File(context.getExternalFilesDir(null) ?: context.filesDir, "pairip-diagnostics-v9.log").absolutePath',
+                      '            )',
+                  ])
+                  if script.count(old_invoke) != 1:
+                      raise SystemExit("Could not safely instrument System.load invocation arguments")
+                  script = script.replace(old_invoke, new_invoke, 1)
+              if step_name == "Compile standalone DEX entrypoint for the game-parent native loader":
+                  pattern = r'(?s)(cat > .*?RuntimeNativeLoader\.java.*?\n)(.*?)(\nJAVA)'
+                  script, count = re.subn(pattern, lambda m: m.group(1) + native_loader_source + m.group(3), script, count=1)
+                  if count != 1:
+                      raise SystemExit("Could not safely add logging around the actual System.load call")
+                  old_javac = 'javac --release 8 -d "$WORK/classes" "$WORK/src/org/levimc/launcher/util/RuntimeNativeLoader.java"'
+                  new_javac = 'javac --release 8 -cp "$ANDROID_HOME/platforms/android-36/android.jar" -d "$WORK/classes" "$WORK/src/org/levimc/launcher/util/RuntimeNativeLoader.java"'
+                  if script.count(old_javac) != 1:
+                      raise SystemExit("Could not safely add Android SDK classpath for the logging helper")
+                  script = script.replace(old_javac, new_javac, 1)
+              if old_pairip_line in script:
+                  if script.count(old_pairip_line) != 1:
+                      raise SystemExit("PairIP branch patch was ambiguous; refusing to build")
+                  script = script.replace(old_pairip_line, new_pairip_lines, 1)
+                  pairip_fix_count += 1
+              if old_dex_check in script:
+                  if script.count(old_dex_check) != 1:
+                      raise SystemExit("ZIP verifier patch was ambiguous; refusing to build")
+                  script = script.replace(old_dex_check, new_dex_check, 1)
+                  dex_fix_count += 1
+
+              # Version the APK and artifacts produced by this run.
+              script = script.replace(
+                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v9-diagnostic"
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk",
+                  "LeviLauncher-ARMv7-PAIRIP-diagnostic-debug-v9.apk",
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5",
+                  "LeviLauncher-ARMv7-PAIRIP-diagnostic-debug-APK-v9",
+              )
+              recipe_run_steps.append((step, script))
+
+          if pairip_fix_count != 1:
+              raise SystemExit(f"Expected exactly one PairIP loader patch; found {pairip_fix_count}")
+          if dex_fix_count != 1:
+              raise SystemExit(f"Expected exactly one ZIP verifier patch; found {dex_fix_count}")
+
+          # These checks run before the old recipe is allowed to start a build.
+          required_recipe_markers = (
+              "PAIRIP_B64_00",
+              "Bundle compressed ARMv7 PairIP dependency",
+              "Compile standalone DEX entrypoint for the game-parent native loader",
+              "Verify the APK targets ARMv7",
+          )
+          original_text = template_path.read_text(encoding="utf-8")
+          missing = [marker for marker in required_recipe_markers if marker not in original_text]
+          if missing:
+              raise SystemExit("Pinned recipe is missing required sections: " + ", ".join(missing))
+
+          any_failed = False
+          build_failed = False
+          run_count = 0
+
+          def condition_allows(step):
+              condition = str(step.get("if", "")).strip()
+              if "always()" in condition:
+                  return True
+              if "failure()" in condition or "steps.build.outcome == 'failure'" in condition:
+                  return any_failed or build_failed
+              if "success()" in condition:
+                  return not any_failed
+              return not any_failed
+
+          def prebuild_checks():
+              manager = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              guard = workspace / "source/app/src/main/java/org/levimc/launcher/util/NativeImageGuard.java"
+              cmake = workspace / "source/app/src/main/cpp/CMakeLists.txt"
+              for f in (manager, guard, cmake):
+                  if not f.is_file():
+                      raise SystemExit(f"Required source file missing before build: {f}")
+              kotlin = manager.read_text(encoding="utf-8")
+              pairip_start = kotlin.find('} else if (normalizedName == "pairipcore") {')
+              playfab_start = kotlin.find(
+                  '} else if (normalizedName == "PlayFabMultiplayer" || normalizedName == "maesdk") {',
+                  pairip_start + 1,
+              ) if pairip_start >= 0 else -1
+              if pairip_start < 0 or playfab_start < 0:
+                  raise SystemExit("PairIP/PlayFab/Mae loader branches were not generated as expected")
+              pairip_branch = kotlin[pairip_start:playfab_start]
+              if "initializeOfficialPairIp()" not in pairip_branch or "loadRuntimeNativeLibrary" in pairip_branch:
+                  raise SystemExit("PairIP is still routed through the custom runtime loader")
+              if 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)' not in kotlin:
+                  raise SystemExit("Official Minecraft package-classloader initialization is missing")
+              guard_text = guard.read_text(encoding="utf-8")
+              if 'if (soFile != null && "libpairipcore.so".equals(soFile.getName())) return false;' not in guard_text:
+                  raise SystemExit("PairIP scan/rewrite exclusion is missing")
+              if "ARMV7_REQUIRE_REAL_GXCORE" in cmake.read_text(encoding="utf-8"):
+                  raise SystemExit("Obsolete deliberate CMake blocker is present")
+              if "ARMV7_GXCORE_COMPAT_SHIM" not in cmake.read_text(encoding="utf-8"):
+                  raise SystemExit("Expected ARMv7 compatibility shim was not installed")
+              # Instrument the existing load path without changing order or skipping any library.
+              helper_marker = "    private fun setupSecurityProvider() {\n"
+              if "private fun logPairIpDiagnostics(stage: String)" not in kotlin:
+                  if kotlin.count(helper_marker) != 1:
+                      raise SystemExit("Could not insert PairIP diagnostic helper into GamePackageManager.kt")
+                  kotlin = kotlin.replace(helper_marker, diag_helper_source + "\n\n" + helper_marker, 1)
+              old_vmrunner = "            Class.forName(\"com.pairip.VMRunner\", true, packageContext.classLoader)\n            report(\"Initialized official PairIP runtime using Minecraft package class loader\")"
+              new_vmrunner = "\n".join([
+                  '            logPairIpDiagnostics("before-VMRunner-Class.forName")',
+                  '            pairIpDiagLog("PAIRIPDIAG action=Class.forName(VMRunner) thread=${Thread.currentThread().name} packageLoader=${pairIpDiagLoaderName(packageContext.classLoader)}")',
+                  '            Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)',
+                  '            logPairIpDiagnostics("after-VMRunner-Class.forName")',
+                  '            report("Initialized official PairIP runtime using Minecraft package class loader")',
+              ])
+              if "PAIRIPDIAG action=Class.forName(VMRunner)" not in kotlin:
+                  if kotlin.count(old_vmrunner) != 1:
+                      raise SystemExit("Could not safely instrument official VMRunner initialization")
+                  kotlin = kotlin.replace(old_vmrunner, new_vmrunner, 1)
+              if 'helper.getMethod("load", String::class.java, String::class.java, String::class.java, String::class.java, String::class.java)' not in kotlin:
+                  raise SystemExit("Four-argument diagnostic loader signature was not installed")
+              if 'File(context.getExternalFilesDir(null) ?: context.filesDir, "pairip-diagnostics-v9.log").absolutePath' not in kotlin:
+                  raise SystemExit("Extracted PairIP path is not passed to the diagnostic loader")
+              manager.write_text(kotlin, encoding="utf-8")
+              print("Pre-build checks passed: v8 loading order preserved; PairIP hashes/maps/thread/class-loader diagnostics installed.")
+
+          for step, script in recipe_run_steps:
+              name = str(step.get("name", "unnamed recipe step"))
+              step_id = str(step.get("id", ""))
+              if not condition_allows(step):
+                  print(f"::notice::Skipping recipe step after prior failure: {name}")
+                  continue
+
+              if step_id == "build":
+                  prebuild_checks()
+
+              working = step.get("working-directory", ".")
+              working = str(working).replace("$" + "{{ github.workspace }}", str(workspace))
+              cwd = Path(working)
+              if not cwd.is_absolute():
+                  cwd = workspace / cwd
+              if not cwd.is_dir():
+                  raise SystemExit(f"Working directory missing for '{name}': {cwd}")
+
+              # GitHub expressions are normally expanded by Actions before a shell
+              # step begins. These translations preserve the supported expressions
+              # used by the pinned shell recipe.
+              script = script.replace("$" + "{{ runner.temp }}", os.environ.get("RUNNER_TEMP", "/tmp"))
+              script = script.replace("$" + "{{ github.workspace }}", str(workspace))
+              if ("$" + "{{") in script:
+                  raise SystemExit(f"Unsupported GitHub expression left in recipe step: {name}")
+
+              child_env = os.environ.copy()
+              for key, value in (step.get("env") or {}).items():
+                  child_env[str(key)] = str(value)
+
+              print(f"\n::group::v9 diagnostic recipe step: {name}")
+              run_count += 1
+              result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=cwd, env=child_env)
+              print(f"::endgroup::")
+              if result.returncode != 0:
+                  print(f"::error::Recipe step failed ({result.returncode}): {name}")
+                  any_failed = True
+                  if step_id == "build":
+                      build_failed = True
+
+          if run_count < 10:
+              raise SystemExit(f"Too few shell steps were executed ({run_count}); refusing to call this build complete")
+          if any_failed:
+              raise SystemExit("One or more v9 diagnostic build steps failed; see the log above and the uploaded diagnostic build-log artifact.")
+          print("All replayed v9 diagnostic build and APK-verification steps completed successfully.")
+          PY
+
+      - name: Upload full v9 diagnostic build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v9-diagnostic
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload installable ARMv7 diagnostic APK (same load path)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-diagnostic-debug-APK-v9
+          path: LeviLauncher-ARMv7-PAIRIP-diagnostic-debug-v9.apk
+          if-no-files-found: error
+          retention-days: 7
