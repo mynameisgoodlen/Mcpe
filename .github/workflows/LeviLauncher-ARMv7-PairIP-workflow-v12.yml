@@ -414,6 +414,21 @@ jobs:
                   )
                   print("Skipping only lintVitalDebug: targetSdk 24 is intentionally required for this Android 10 test candidate.")
               if name == "Verify the APK targets ARMv7":
+                  # aapt may return non-zero after printing full badging; validate its output and ZIP separately.
+                  aapt_marker = '"$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | tee /tmp/apk-badging.txt'
+                  if script.count(aapt_marker) != 1:
+                      raise SystemExit("Could not patch the exact aapt badging command for diagnostic verification")
+                  aapt_replacement = "\n".join([
+                      "set +e",
+                      '"$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" > /tmp/apk-badging.txt 2>&1',
+                      "aapt_status=$?",
+                      "set -e",
+                      "cat /tmp/apk-badging.txt",
+                      'if [ "$aapt_status" -ne 0 ]; then',
+                      '  echo "::warning::aapt dump badging returned $aapt_status; continuing only if ABI, target-SDK, and ZIP checks pass." >&2',
+                      "fi",
+                  ])
+                  script = script.replace(aapt_marker, aapt_replacement, 1)
                   abi_marker = """grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt"""
                   if abi_marker not in script:
                       raise SystemExit("Could not add targetSdk manifest check to APK verification")
