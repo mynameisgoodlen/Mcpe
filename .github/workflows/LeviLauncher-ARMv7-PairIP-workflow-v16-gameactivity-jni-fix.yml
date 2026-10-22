@@ -1,0 +1,661 @@
+name: Build LeviLauncher ARMv7 GameActivity JNI-fix APK v16 (Android 10)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v16-gameactivity-jni-fix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out this builder workflow
+        uses: actions/checkout@v4
+
+      - name: Check out LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: 38764ca77b4fcb9c27ab3cec688e67e5166141df
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Fetch pinned recipe and build v16 official-Minecraft-namespace candidate
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          TEMPLATE="$RUNNER_TEMP/LeviLauncher-ARMv7-PairIP-workflow-v5-template.yml"
+          URL="https://raw.githubusercontent.com/mynameisgoodlen/Mcpe/${TEMPLATE_COMMIT}/.github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v5.yml"
+          curl --fail --silent --show-error --location "$URL" --retry 3 --retry-delay 2 -o "$TEMPLATE"
+          test -s "$TEMPLATE"
+          echo "Pinned recipe downloaded: $(wc -c < "$TEMPLATE") bytes"
+          python3 - "$TEMPLATE" <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import textwrap
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          template_path = Path(sys.argv[1])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+          jobs = document.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected one job in pinned recipe; got {len(jobs)}")
+          steps = next(iter(jobs.values())).get("steps", [])
+          if not steps:
+              raise SystemExit("Pinned build recipe has no steps")
+
+          # Keep v8's PairIP branch patch and verifier fix; the final shared
+          # class-loader step below routes the relevant libraries through one namespace.
+          old_pairip_line = "i + '} else if (normalizedName == \"pairipcore\" || normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',"
+          new_pairip_lines = "\n".join([
+              "i + '} else if (normalizedName == \"pairipcore\") {',",
+              "                  i + '    initializeOfficialPairIp()',",
+              "                  i + '} else if (normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',",
+          ])
+          old_dex_check = (
+              "loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "    raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+          new_dex_check = (
+              "    loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "    if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "        raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+
+          recipe_run_steps = []
+          pairip_fix_count = 0
+          dex_fix_count = 0
+          for step in steps:
+              if "run" not in step:
+                  continue
+              script = step["run"]
+              if old_pairip_line in script:
+                  if script.count(old_pairip_line) != 1:
+                      raise SystemExit("PairIP branch patch was ambiguous; refusing to build")
+                  script = script.replace(old_pairip_line, new_pairip_lines, 1)
+                  pairip_fix_count += 1
+              if old_dex_check in script:
+                  if script.count(old_dex_check) != 1:
+                      raise SystemExit("ZIP verifier patch was ambiguous; refusing to build")
+                  script = script.replace(old_dex_check, new_dex_check, 1)
+                  dex_fix_count += 1
+
+              script = script.replace(
+                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v16"
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v16.apk",
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v16",
+              )
+              recipe_run_steps.append((step, script))
+
+          if pairip_fix_count != 1:
+              raise SystemExit(f"Expected exactly one PairIP loader patch; found {pairip_fix_count}")
+          if dex_fix_count != 1:
+              raise SystemExit(f"Expected exactly one ZIP verifier patch; found {dex_fix_count}")
+
+          required_recipe_markers = (
+              "PAIRIP_B64_00",
+              "Bundle compressed ARMv7 PairIP dependency",
+              "Extract and preload PlayFab and Mae dependencies before Minecraft",
+              "Load the Minecraft native dependency chain with a shared game-parent classloader",
+              "Compile standalone DEX entrypoint for the game-parent native loader",
+              "Verify the APK targets ARMv7",
+          )
+          original_text = template_path.read_text(encoding="utf-8")
+          missing = [marker for marker in required_recipe_markers if marker not in original_text]
+          if missing:
+              raise SystemExit("Pinned recipe is missing required sections: " + ", ".join(missing))
+
+          any_failed = False
+          build_failed = False
+          run_count = 0
+
+          def condition_allows(step):
+              condition = str(step.get("if", "")).strip()
+              if "always()" in condition:
+                  return True
+              if "failure()" in condition or "steps.build.outcome == 'failure'" in condition:
+                  return any_failed or build_failed
+              if "success()" in condition:
+                  return not any_failed
+              return not any_failed
+
+          def prebuild_checks_and_safe_order():
+              manager = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              guard = workspace / "source/app/src/main/java/org/levimc/launcher/util/NativeImageGuard.java"
+              cmake = workspace / "source/app/src/main/cpp/CMakeLists.txt"
+              activity = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftActivity.kt"
+              for f in (manager, guard, cmake, activity):
+                  if not f.is_file():
+                      raise SystemExit(f"Required source file missing before build: {f}")
+
+              # Android's official GameActivity migration guide recommends this exact
+              # linker keep-symbol workaround for initializeNativeCode UnsatisfiedLinkError.
+              # Insert it after project() and before native targets are declared, so it
+              # reaches the shared-library link step rather than being added too late.
+              cmake_text = cmake.read_text(encoding="utf-8")
+              game_activity_symbol = "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode"
+              game_activity_link_line = (
+                  'set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -u '
+                  + game_activity_symbol + '")'
+              )
+              if game_activity_symbol not in cmake_text:
+                  project_pattern = re.compile(r'(?im)^[ \t]*project[ \t]*\([^\n]*\)[ \t]*$')
+                  project_matches = list(project_pattern.finditer(cmake_text))
+                  if len(project_matches) != 1:
+                      raise SystemExit(
+                          "Expected exactly one single-line project(...) in CMakeLists.txt; "
+                          "cannot safely place the GameActivity linker workaround"
+                      )
+                  project_end = project_matches[0].end()
+                  cmake_text = (
+                      cmake_text[:project_end] + "\n\n" + game_activity_link_line
+                      + cmake_text[project_end:]
+                  )
+                  cmake.write_text(cmake_text, encoding="utf-8")
+                  print("Inserted official GameActivity JNI keep-symbol linker workaround before native targets.")
+              else:
+                  cmake_text = cmake.read_text(encoding="utf-8")
+                  if cmake_text.count(game_activity_link_line) != 1:
+                      raise SystemExit(
+                          "GameActivity JNI symbol is already mentioned in CMakeLists.txt, "
+                          "but not as the exact verified linker workaround; refusing to build"
+                      )
+
+              cmake_text = cmake.read_text(encoding="utf-8")
+              if cmake_text.count(game_activity_link_line) != 1:
+                  raise SystemExit("GameActivity linker workaround must appear exactly once")
+              first_target = re.search(r'(?im)^[ \t]*(?:add_library|add_executable)[ \t]*\(', cmake_text)
+              if not first_target:
+                  raise SystemExit("Could not find a native CMake target after inserting GameActivity workaround")
+              if cmake_text.index(game_activity_link_line) >= first_target.start():
+                  raise SystemExit("GameActivity linker workaround is after a native target; refusing to build")
+              if "-u " + game_activity_symbol not in cmake_text:
+                  raise SystemExit("GameActivity linker keep-symbol option is missing")
+              print("Verified CMake ordering: linker keep-symbol option occurs before the first native target.")
+
+              kotlin = manager.read_text(encoding="utf-8")
+
+              # v8/v10 tombstones show the cached PairIP and installed Minecraft
+              # PairIP mapped simultaneously. PlayFab is loaded from the cache and
+              # has hidden PLT slots; keep its dependency tied to the already-initialized
+              # Minecraft parent namespace instead of loading a second cached PairIP.
+              dep_pattern = re.compile(r'(?ms)^    private val runtimeDependencyLibs = arrayOf\(\n.*?^    \)')
+              dep_match = dep_pattern.search(kotlin)
+              if not dep_match:
+                  raise SystemExit("Could not find runtimeDependencyLibs to remove the duplicate PairIP entry")
+              dep_block = dep_match.group(0)
+              dep_line_pattern = re.compile(r'(?m)^[ \t]*"libpairipcore\.so",?[ \t]*\n')
+              if dep_line_pattern.subn("", dep_block)[1] != 1:
+                  raise SystemExit("Expected exactly one cached PairIP entry; refusing to build an ambiguous loader")
+              dep_block = dep_line_pattern.sub("", dep_block, count=1)
+              kotlin = kotlin[:dep_match.start()] + dep_block + kotlin[dep_match.end():]
+
+              # Old cache directories survive APK updates. Delete the old cached copy
+              # every run so it cannot shadow Minecraft's initialized PairIP.
+              extraction_anchor = "        val apkFiles = collectApkFiles()\n"
+              stale_pairip_cleanup = '''        val stalePairIp = File(outputDir, "libpairipcore.so")
+                      if (stalePairIp.exists() && !stalePairIp.delete()) {
+                          throw IOException("Cannot remove stale cached PairIP copy: ${stalePairIp.absolutePath}")
+                      }
+                      report("Removed stale cached PairIP copy; using Minecraft parent-loader PairIP")
+                      val apkFiles = collectApkFiles()
+              '''
+              if kotlin.count(extraction_anchor) != 1:
+                  raise SystemExit("Could not safely insert stale PairIP cache cleanup")
+              kotlin = kotlin.replace(extraction_anchor, stale_pairip_cleanup, 1)
+
+              # Load all extracted Minecraft native libraries through the official
+              # Minecraft package ClassLoader, not an isolated helper DexClassLoader.
+              # Android 10's Runtime.load(String, ClassLoader) uses that exact loader's
+              # native-linker namespace. VMRunner initializes PairIP in this namespace
+              # first, so PlayFab's DT_NEEDED dependency reuses that same PairIP instance.
+              # Runtime.load(String, ClassLoader) is private and explicitly rejects targetSdk > 24
+              # on Android 10. This sideloaded Android-10-only candidate lowers targetSdk to 24
+              # and verifies the packaged manifest so the private API's explicit precondition holds.
+              native_method_pattern = re.compile(
+                  r'(?ms)^    private fun loadRuntimeNativeLibrary\(file: File\) \{\n.*?^    \}'
+              )
+              native_method_match = native_method_pattern.search(kotlin)
+              if not native_method_match:
+                  raise SystemExit("Could not find loadRuntimeNativeLibrary; refusing to guess")
+              native_method = '''    private fun loadRuntimeNativeLibrary(file: File) {
+                  if (!file.isFile || file.length() == 0L) {
+                      throw UnsatisfiedLinkError("Native library is missing or empty: ${file.absolutePath}")
+                  }
+                  val targetLoader = packageContext.classLoader
+                  val method = synchronized(runtimeNativeLoaderLock) {
+                      runtimeNativeLoadMethod ?: java.lang.Runtime::class.java
+                          .getDeclaredMethod("load", String::class.java, ClassLoader::class.java)
+                          .apply { isAccessible = true }
+                          .also { runtimeNativeLoadMethod = it }
+                  }
+                  report("Loading ${file.name} through Minecraft ClassLoader ${targetLoader.javaClass.name}: ${file.absolutePath}")
+                  try {
+                      method.invoke(java.lang.Runtime.getRuntime(), file.absolutePath, targetLoader)
+                      report("Loaded ${file.name} through Minecraft ClassLoader namespace")
+                  } catch (e: InvocationTargetException) {
+                      val cause = e.targetException
+                      if (cause is UnsatisfiedLinkError) throw cause
+                      throw UnsatisfiedLinkError(
+                          "Minecraft ClassLoader failed to load ${file.name}: ${cause.message ?: cause.javaClass.simpleName}"
+                      ).also { it.initCause(cause) }
+                  } catch (e: Exception) {
+                      throw UnsatisfiedLinkError(
+                          "Could not load ${file.name} through Minecraft ClassLoader: ${e.message ?: e.javaClass.simpleName}"
+                      ).also { it.initCause(e) }
+                  }
+              }
+
+              '''
+              kotlin = kotlin[:native_method_match.start()] + native_method + kotlin[native_method_match.end():]
+              # The earlier patch no longer needs its custom DEX ClassLoader import.
+              kotlin = kotlin.replace('import dalvik.system.DexClassLoader\n', '')
+
+              # Verify the actual implementation, not only that a loader patch exists.
+              dep_match = dep_pattern.search(kotlin)
+              if not dep_match or '"libpairipcore.so"' in dep_match.group(0):
+                  raise SystemExit("PairIP is still present in the extracted runtime dependency list")
+              if "stalePairIp.delete()" not in kotlin:
+                  raise SystemExit("Stale PairIP cache cleanup missing")
+              if "private fun loadRuntimeNativeLibrary(file: File)" not in kotlin:
+                  raise SystemExit("Minecraft-namespace native loader method is missing")
+              native_method_match = native_method_pattern.search(kotlin)
+              if not native_method_match:
+                  raise SystemExit("Could not verify the final native-loader method")
+              native_method_text = native_method_match.group(0)
+              for marker in (
+                  'getDeclaredMethod("load", String::class.java, ClassLoader::class.java)',
+                  'method.invoke(java.lang.Runtime.getRuntime(), file.absolutePath, targetLoader)',
+                  'val targetLoader = packageContext.classLoader',
+                  'report("Loaded ${file.name} through Minecraft ClassLoader namespace")',
+              ):
+                  if marker not in native_method_text:
+                      raise SystemExit("Minecraft ClassLoader loading is incomplete; missing: " + marker)
+              if "DexClassLoader(" in native_method_text:
+                  raise SystemExit("The custom child class-loader path remains")
+              if 'import dalvik.system.DexClassLoader\n' in kotlin:
+                  raise SystemExit("Unused isolated DexClassLoader import remains")
+              if "private val runtimeDependencyLibs = arrayOf(" not in kotlin:
+                  raise SystemExit("PlayFab/Mae extraction list is missing")
+              for marker in (
+                  '"libPlayFabMultiplayer.so"',
+                  '"libmaesdk.so"',
+                  'loadRuntimeNativeLibrary(libFile)',
+              ):
+                  if marker not in kotlin:
+                      raise SystemExit("Runtime dependency loading is incomplete; missing: " + marker)
+              # PairIP itself must be initialized through the installed Minecraft package loader.
+              pairip_route = re.search(
+                  r'(?ms)^[ \t]*\}\s*else if \(normalizedName == "pairipcore"\) \{\n'
+                  r'(?P<body>.*?)^[ \t]*\}\s*else if \(normalizedName == "PlayFabMultiplayer" \|\| normalizedName == "maesdk"\) \{',
+                  kotlin,
+              )
+              if not pairip_route or "initializeOfficialPairIp()" not in pairip_route.group("body") or "loadRuntimeNativeLibrary" in pairip_route.group("body"):
+                  raise SystemExit("PairIP must use Minecraft's official package ClassLoader")
+              runtime_route = re.search(
+                  r'(?ms)^[ \t]*\}\s*else if \(normalizedName == "PlayFabMultiplayer" \|\| normalizedName == "maesdk"\) \{\n'
+                  r'(?P<body>.*?)^[ \t]*\} else \{',
+                  kotlin,
+              )
+              if not runtime_route or "loadRuntimeNativeLibrary(dependency)" not in runtime_route.group("body"):
+                  raise SystemExit("PlayFab/Mae must load through the Minecraft ClassLoader")
+              if "System.loadLibrary(normalizedName)" in runtime_route.group("body"):
+                  raise SystemExit("PlayFab/Mae still bypass the Minecraft ClassLoader")
+
+              # Fix the regression seen in v8: PlayFab/Mae were explicitly loaded
+              # before libminecraftpe.so, and libPlayFabMultiplayer.so crashed in
+              # native initialization. Keep them extracted and in the same search
+              # path, but schedule their explicit System.load calls after Minecraft,
+              # matching upstream dependency order while preserving the custom loader.
+              order_pattern = re.compile(r'(?ms)^[ \t]*val allLibs = buildList \{\n.*?^[ \t]*\}\.distinct\(\)')
+              order_replacement = '''        val allLibs = buildList {
+                          // Initialize PairIP in Minecraft's official package ClassLoader first.
+                          // Extracted libraries are then passed to Runtime.load(path, thatLoader),
+                          // keeping their DT_NEEDED PairIP edge in the same namespace.
+                          add("libpairipcore.so")
+                          add("libc++_shared.so")
+                          requiredLibs.filterNot { it == "libc++_shared.so" || it == "libminecraftpe.so" }.forEach { add(it) }
+                          optionalLibs.forEach { add(it) }
+                          add("libminecraftpe.so")
+                          systemLoadedLibs.filterNot { it == "libpairipcore.so" }.forEach { add(it) }
+                      }.distinct()'''
+              kotlin, order_count = order_pattern.subn(order_replacement, kotlin, count=1)
+              if order_count != 1:
+                  raise SystemExit(f"Expected exactly one native load-order block; found {order_count}")
+              block_start = kotlin.find("val allLibs = buildList {")
+              block_end = kotlin.find("}.distinct()", block_start)
+              if block_start < 0 or block_end < 0:
+                  raise SystemExit("Could not verify final native load order")
+              order_block = kotlin[block_start:block_end]
+              pairip_pos = order_block.find('add("libpairipcore.so")')
+              cxx_pos = order_block.find('add("libc++_shared.so")')
+              minecraft_pos = order_block.find('add("libminecraftpe.so")')
+              system_pos = order_block.find("systemLoadedLibs.filterNot")
+              if pairip_pos < 0 or cxx_pos < 0 or pairip_pos > cxx_pos:
+                  raise SystemExit("Official PairIP must initialize before extracted native libraries")
+              if minecraft_pos < 0 or system_pos < 0 or minecraft_pos > system_pos:
+                  raise SystemExit("Unsafe load order remains: PlayFab/Mae must follow Minecraft")
+              if 'add("libPlayFabMultiplayer.so")' in order_block or 'add("libmaesdk.so")' in order_block:
+                  raise SystemExit("PlayFab/Mae were still hard-coded ahead of Minecraft")
+              if 'getDeclaredMethod("load", String::class.java, ClassLoader::class.java)' not in native_method_text:
+                  raise SystemExit("The Android Runtime.load(path, classLoader) route is missing")
+              if "val targetLoader = packageContext.classLoader" not in native_method_text:
+                  raise SystemExit("Native libraries are not routed through Minecraft's actual ClassLoader")
+              if "DexClassLoader(" in native_method_text:
+                  raise SystemExit("An obsolete child-loader call remains inside the native-load method")
+
+              # This candidate is pinned to an exact upstream source revision. Disable R8
+              # for the debug variant so its DEX layout is not needlessly shrunk as in v10.
+              app_gradle = workspace / "source/app/build.gradle"
+              if not app_gradle.is_file():
+                  raise SystemExit("Pinned v1.5.27 app/build.gradle is missing")
+              gradle_text = app_gradle.read_text(encoding="utf-8")
+              debug_start = gradle_text.find("    debug {")
+              beta_start = gradle_text.find("    beta {", debug_start)
+              if debug_start < 0 or beta_start < 0:
+                  raise SystemExit("Could not isolate the debug build configuration")
+              debug_block = gradle_text[debug_start:beta_start]
+              if "minifyEnabled true" in debug_block:
+                  patched_debug, changed = re.subn(
+                      r'(?m)^(?P<indent>[ \t]*)minifyEnabled true[ \t]*$',
+                      r'\g<indent>minifyEnabled false',
+                      debug_block,
+                      count=1,
+                  )
+                  if changed != 1:
+                      raise SystemExit("Could not safely disable R8 for the debug variant")
+                  gradle_text = gradle_text[:debug_start] + patched_debug + gradle_text[beta_start:]
+                  app_gradle.write_text(gradle_text, encoding="utf-8")
+                  debug_block = patched_debug
+                  print("Disabled R8 shrinking for debug APK to avoid v10's reduced DEX payload.")
+              if "minifyEnabled false" not in debug_block or "minifyEnabled true" in debug_block:
+                  raise SystemExit("Debug R8 shrinking is enabled or ambiguous")
+
+              # Android 10 Runtime.load(String, ClassLoader) rejects targetSdk > 24.
+              # Keep this strictly an Android 10 sideload/debug test candidate.
+              target_pattern = re.compile(r'(?m)^(?P<indent>[ \t]*)targetSdkVersion[ \t]+35[ \t]*$')
+              gradle_text, target_count = target_pattern.subn(r'\g<indent>targetSdkVersion 24', gradle_text, count=1)
+              if target_count != 1:
+                  raise SystemExit(f"Expected exactly one targetSdkVersion 35 in pinned app/build.gradle; found {target_count}")
+              if not re.search(r'(?m)^[ \t]*targetSdkVersion[ \t]+24[ \t]*$', gradle_text):
+                  raise SystemExit("Target SDK 24 compatibility precondition was not applied")
+              app_gradle.write_text(gradle_text, encoding="utf-8")
+
+              manager.write_text(kotlin, encoding="utf-8")
+
+              # The previous Java tombstone is a secondary lifecycle error: this catch
+              # returns before MainActivity.onCreate(), hiding the original preparation
+              # exception. Preserve the full cause for the next diagnostic run.
+              activity_text = activity.read_text(encoding="utf-8")
+              old_activity_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  '            trace.error("MinecraftActivity prepare failed", formatLaunchFailure(throwable))',
+                  "            returnToLauncherAfterLaunchFailure()",
+                  "            return",
+                  "        }",
+              ])
+              new_activity_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  "            trace.error(",
+                  '                "MinecraftActivity prepare failed",',
+                  "                android.util.Log.getStackTraceString(throwable)",
+                  "            )",
+                  "            throw IllegalStateException(",
+                  '                "MinecraftActivity runtime preparation failed before super.onCreate",',
+                  "                throwable",
+                  "            )",
+                  "        }",
+              ])
+              if activity_text.count(old_activity_failure_branch) != 1:
+                  raise SystemExit("Could not uniquely patch MinecraftActivity's early-return catch; refusing to build")
+              activity_text = activity_text.replace(old_activity_failure_branch, new_activity_failure_branch, 1)
+              if old_activity_failure_branch in activity_text:
+                  raise SystemExit("The invalid early-return failure branch remains in MinecraftActivity")
+              if "Log.getStackTraceString(throwable)" not in activity_text or "MinecraftActivity runtime preparation failed before super.onCreate" not in activity_text:
+                  raise SystemExit("MinecraftActivity failure cause logging is incomplete")
+              activity.write_text(activity_text, encoding="utf-8")
+              print("Patched MinecraftActivity's preparation catch to preserve the original exception.")
+
+              # Also fix the independent catch around Mojang MainActivity.onCreate().
+              # Returning from this catch masks the original throwable as SuperNotCalledException.
+              old_super_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  '            trace.error("Mojang MainActivity super.onCreate failed", formatLaunchFailure(throwable))',
+                  "            returnToLauncherAfterLaunchFailure()",
+                  "            return",
+                  "        }",
+              ])
+              new_super_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  "            val fullStackTrace = android.util.Log.getStackTraceString(throwable)",
+                  '            trace.error("Mojang MainActivity super.onCreate failed", fullStackTrace)',
+                  '            android.util.Log.e("MinecraftActivity", "Mojang MainActivity.onCreate failed", throwable)',
+                  "            throw IllegalStateException(",
+                  '                "Mojang MainActivity.onCreate failed",',
+                  "                throwable",
+                  "            )",
+                  "        }",
+              ])
+              if activity_text.count(old_super_failure_branch) != 1:
+                  raise SystemExit("Could not uniquely find Mojang onCreate catch; refusing to build")
+              activity_text = activity_text.replace(old_super_failure_branch, new_super_failure_branch, 1)
+              if old_super_failure_branch in activity_text:
+                  raise SystemExit("Unsafe Mojang onCreate catch remains")
+              if 'trace.error("Mojang MainActivity super.onCreate failed", fullStackTrace)' not in activity_text:
+                  raise SystemExit("Full Mojang onCreate stack trace logging is missing")
+              if 'android.util.Log.e("MinecraftActivity", "Mojang MainActivity.onCreate failed", throwable)' not in activity_text:
+                  raise SystemExit("Android logcat exception-preservation call is missing")
+              if '"Mojang MainActivity.onCreate failed",' not in activity_text:
+                  raise SystemExit("Original Mojang onCreate exception is not preserved")
+              activity.write_text(activity_text, encoding="utf-8")
+              print("Patched Mojang MainActivity.onCreate catch to log and rethrow the original throwable instead of returning and masking it.")
+
+              # Preserve the full Java cause when runtime preparation fails in the loading activity.
+              # The previous candidate displayed only throwable.message, hiding the useful cause chain.
+              loading_activity = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftLoadingActivity.kt"
+              if not loading_activity.is_file():
+                  raise SystemExit(f"Required source file missing before diagnostics patch: {loading_activity}")
+              loading_text = loading_activity.read_text(encoding="utf-8")
+              old_show_failure = "\n".join([
+                  "    private fun showFailure(throwable: Throwable) {",
+                  "        if (isFinishing || isDestroyed) return",
+                  "        val message = throwable.message ?: throwable.javaClass.simpleName",
+                  "        updateProgress(100, getString(R.string.minecraft_loading_failed), null)",
+                  "        detailView.visibility = View.GONE",
+                  '        trace.error("Launch failed", message)',
+                  '        appendLog("Launch failed")',
+                  "        appendLog(message)",
+                  "        returnButton.visibility = View.VISIBLE",
+                  "    }",
+              ])
+              new_show_failure = "\n".join([
+                  "    private fun showFailure(throwable: Throwable) {",
+                  "        if (isFinishing || isDestroyed) return",
+                  "        val message = throwable.message ?: throwable.javaClass.simpleName",
+                  "        val stackTrace = android.util.Log.getStackTraceString(throwable)",
+                  "        updateProgress(100, getString(R.string.minecraft_loading_failed), null)",
+                  "        detailView.visibility = View.GONE",
+                  '        trace.error("Launch failed", stackTrace)',
+                  '        appendLog("Launch failed")',
+                  "        appendLog(message)",
+                  "        appendLog(stackTrace)",
+                  "        returnButton.visibility = View.VISIBLE",
+                  "    }",
+              ])
+              if loading_text.count(old_show_failure) != 1:
+                  raise SystemExit("Could not uniquely patch MinecraftLoadingActivity.showFailure; refusing to build")
+              loading_text = loading_text.replace(old_show_failure, new_show_failure, 1)
+              if 'trace.error("Launch failed", stackTrace)' not in loading_text or "appendLog(stackTrace)" not in loading_text:
+                  raise SystemExit("Full Java cause logging was not applied")
+              loading_activity.write_text(loading_text, encoding="utf-8")
+              print("Patched loading failure UI to show and log the full Java exception stack, not only its top-level message.")
+
+              guard_text = guard.read_text(encoding="utf-8")
+              if 'if (soFile != null && "libpairipcore.so".equals(soFile.getName())) return false;' not in guard_text:
+                  raise SystemExit("PairIP scan/rewrite exclusion is missing")
+              if "ARMV7_REQUIRE_REAL_GXCORE" in cmake.read_text(encoding="utf-8"):
+                  raise SystemExit("Obsolete deliberate CMake blocker is present")
+              if "ARMV7_GXCORE_COMPAT_SHIM" not in cmake.read_text(encoding="utf-8"):
+                  raise SystemExit("Expected ARMv7 compatibility shim was not installed")
+              print("Pre-build checks passed: native loader patch applied; Activity failure now preserves the original exception; debug R8 is disabled; targetSdk is 24 for Android 10 compatibility testing.")
+
+          for step, script in recipe_run_steps:
+              name = str(step.get("name", "unnamed recipe step"))
+              step_id = str(step.get("id", ""))
+              if not condition_allows(step):
+                  print(f"::notice::Skipping recipe step after prior failure: {name}")
+                  continue
+              if step_id == "build":
+                  prebuild_checks_and_safe_order()
+
+              working = str(step.get("working-directory", ".")).replace("$" + "{{ github.workspace }}", str(workspace))
+              cwd = Path(working)
+              if not cwd.is_absolute():
+                  cwd = workspace / cwd
+              if not cwd.is_dir():
+                  raise SystemExit(f"Working directory missing for '{name}': {cwd}")
+
+              script = script.replace("$" + "{{ runner.temp }}", os.environ.get("RUNNER_TEMP", "/tmp"))
+              script = script.replace("$" + "{{ github.workspace }}", str(workspace))
+              if name == "Build debug APK for ARMv7 and capture all output":
+                  build_marker = './gradlew --no-daemon --stacktrace --info --console=plain :app:assembleDebug 2>&1 | tee "$LOG"'
+                  if script.count(build_marker) != 1:
+                      raise SystemExit("Could not patch the exact debug Gradle command to bypass expired-target lint")
+                  script = script.replace(
+                      build_marker,
+                      './gradlew --no-daemon --stacktrace --info --console=plain :app:assembleDebug -x :app:lintVitalDebug 2>&1 | tee "$LOG"',
+                      1,
+                  )
+                  print("Skipping only lintVitalDebug: targetSdk 24 is intentionally required for this Android 10 test candidate.")
+              if name == "Verify the APK targets ARMv7":
+                  abi_marker = """grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt"""
+                  if abi_marker not in script:
+                      raise SystemExit("Could not add targetSdk manifest check to APK verification")
+                  target_sdk_checks = "\n".join([
+                      abi_marker,
+                      "grep -q \"targetSdkVersion:'24'\" /tmp/apk-badging.txt",
+                      "echo \"Verified target SDK 24 for Android 10 Runtime.load(ClassLoader) compatibility.\"",
+                  ])
+                  script = script.replace(abi_marker, target_sdk_checks, 1)
+                  # Require the final APK to export the JNI implementation Android needs.
+                  # If the source or static-library linkage is wrong, fail instead of publishing a bad APK.
+
+                  symbol_check = textwrap.dedent(r'''
+                      set -euo pipefail
+                      APK="${GITHUB_WORKSPACE}/LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v16.apk"
+                      if [ ! -f "$APK" ]; then
+                        echo "Expected versioned APK is missing: $APK" >&2
+                        exit 1
+                      fi
+                      SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+                      NM="$(find "$SDK_ROOT/ndk" -type f -name llvm-nm -print -quit 2>/dev/null || true)"
+                      if [ -z "$NM" ] && command -v llvm-nm >/dev/null 2>&1; then NM="$(command -v llvm-nm)"; fi
+                      if [ -z "$NM" ]; then
+                        echo "Cannot verify JNI symbol: Android NDK llvm-nm was not found." >&2
+                        exit 1
+                      fi
+                      python3 - "$APK" "$NM" <<'PY_SYMBOL_CHECK'
+                      import subprocess, sys, tempfile, zipfile
+                      from pathlib import Path
+                      apk, nm, symbol = sys.argv[1], sys.argv[2], "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode"
+                      with zipfile.ZipFile(apk) as archive:
+                          candidates = [n for n in archive.namelist() if n == "lib/armeabi-v7a/libpreloader.so"]
+                          if len(candidates) != 1:
+                              raise SystemExit("Expected exactly one lib/armeabi-v7a/libpreloader.so in final APK; found " + str(len(candidates)))
+                          data = archive.read(candidates[0])
+                      with tempfile.TemporaryDirectory(prefix="gameactivity-jni-check-") as directory:
+                          so = Path(directory) / "libpreloader.so"
+                          so.write_bytes(data)
+                          result = subprocess.run([nm, "-D", "--defined-only", str(so)], text=True, capture_output=True)
+                          if result.returncode != 0:
+                              raise SystemExit("llvm-nm failed to inspect dynamic symbols: " + result.stderr)
+                          if not any(line.split() and line.split()[-1] == symbol for line in result.stdout.splitlines()):
+                              raise SystemExit("JNI symbol is NOT exported by ARMv7 libpreloader.so. Rejecting this APK; linker flag alone did not fix the source/linkage.")
+                      print("PASS: final APK's ARMv7 libpreloader.so dynamically exports " + symbol)
+                      PY_SYMBOL_CHECK
+                  ''')
+                  script += symbol_check
+                  print("Added final APK ELF verification for the required GameActivity JNI export.")
+
+              if ("$" + "{{") in script:
+                  raise SystemExit(f"Unsupported GitHub expression left in recipe step: {name}")
+
+              child_env = os.environ.copy()
+              for key, value in (step.get("env") or {}).items():
+                  child_env[str(key)] = str(value)
+
+              print(f"\n::group::v16 diagnostic recipe step: {name}")
+              run_count += 1
+              result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=cwd, env=child_env)
+              print("::endgroup::")
+              if result.returncode != 0:
+                  print(f"::error::Recipe step failed ({result.returncode}): {name}")
+                  any_failed = True
+                  if step_id == "build":
+                      build_failed = True
+
+          if run_count < 9:
+              raise SystemExit(f"Too few shell steps were executed ({run_count}); refusing to call this build complete")
+          if any_failed:
+              raise SystemExit("One or more v16 build steps failed; inspect the uploaded build log")
+          print("Build and static verification succeeded, including the GameActivity JNI export; actual device launch remains unverified.")
+          PY
+
+      - name: Upload full build log for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v16
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload installable ARMv7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v16
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v16.apk
+          if-no-files-found: error
+          retention-days: 7
