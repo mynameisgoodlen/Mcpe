@@ -1,4 +1,4 @@
-name: Build LeviLauncher ARMv7 V14 single-PairIP namespace fix APK (Android 10)
+name: Build LeviLauncher ARMv7 V14 single-PairIP fix APK (Android 10)
 
 on:
   workflow_dispatch:
@@ -96,10 +96,60 @@ jobs:
           recipe_run_steps = []
           pairip_fix_count = 0
           dex_fix_count = 0
+          skipped_pairip_packager_count = 0
+          verifier_pairip_fix_count = 0
           for step in steps:
+              step_name = str(step.get("name", ""))
+              if step_name == "Bundle compressed ARMv7 PairIP dependency (self-contained workflow)":
+                  # Do not put a second libpairipcore.so in LeviLauncher's JNI namespace.
+                  # The installed Minecraft package's VMRunner must initialize its own copy.
+                  skipped_pairip_packager_count += 1
+                  print("Skipping launcher-bundled PairIP to prevent duplicate protected runtime copies.")
+                  continue
               if "run" not in step:
                   continue
               script = step["run"]
+
+              # The pinned recipe's final APK checker originally required the bundled PairIP.
+              # Replace that requirement with a hard guard that the launcher APK contains NO PairIP.
+              if step_name == "Verify the APK targets ARMv7":
+                  old_pairip_call = "python3 - 'LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk' 'source/app/src/main/jniLibs/armeabi-v7a/libpairipcore.so' <<'PY'"
+                  new_pairip_call = "python3 - 'LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk' <<'PY'"
+                  if script.count(old_pairip_call) != 1:
+                      raise SystemExit("Could not safely remove the PairIP binary argument from APK verification")
+                  script = script.replace(old_pairip_call, new_pairip_call, 1)
+                  if script.count("expected_pairip = pathlib.Path(sys.argv[2]).read_bytes()") != 1:
+                      raise SystemExit("Could not safely remove the bundled PairIP verifier input")
+                  script = script.replace("expected_pairip = pathlib.Path(sys.argv[2]).read_bytes()\n", "", 1)
+                  if script.count("              'lib/armeabi-v7a/libpairipcore.so',\n") != 1:
+                      # YAML parsing removes common indentation; support that normalized indentation too.
+                      script, removed_required = re.subn(r"(?m)^[ \t]*'lib/armeabi-v7a/libpairipcore\.so',[ \t]*\n", "", script, count=1)
+                      if removed_required != 1:
+                          raise SystemExit("Could not remove PairIP from the required APK entries")
+                  else:
+                      script = script.replace("              'lib/armeabi-v7a/libpairipcore.so',\n", "", 1)
+                  pairip_check_pattern = re.compile(
+                      r"(?ms)^[ \t]*packaged_pairip = z\.read\('lib/armeabi-v7a/libpairipcore\.so'\)\n"
+                      r".*?^[ \t]*raise SystemExit\('Packaged libpairipcore\.so is not a 32-bit ARM ELF'\)\n"
+                  )
+                  script, pairip_block_removed = pairip_check_pattern.subn("", script, count=1)
+                  if pairip_block_removed != 1:
+                      raise SystemExit("Could not safely remove the bundled PairIP byte-identity check")
+                  names_line = "    names = set(z.namelist())\n"
+                  guard_lines = (
+                      "    names = set(z.namelist())\n"
+                      "    if 'lib/armeabi-v7a/libpairipcore.so' in names:\n"
+                      "        raise SystemExit('Duplicate PairIP detected: launcher APK must not package libpairipcore.so; use the installed Minecraft package copy.')\n"
+                  )
+                  if script.count(names_line) != 1:
+                      raise SystemExit("Could not insert the no-duplicate-PairIP APK guard")
+                  script = script.replace(names_line, guard_lines, 1)
+                  script = script.replace(
+                      "print('Verified ARMv7 gxcore, libc++, byte-identical PairIP, and runtime-loader DEX in', apk)",
+                      "print('Verified ARMv7 gxcore and libc++, confirmed no launcher PairIP copy, and validated runtime-loader DEX in', apk)",
+                      1,
+                  )
+                  verifier_pairip_fix_count += 1
               if old_pairip_line in script:
                   if script.count(old_pairip_line) != 1:
                       raise SystemExit("PairIP branch patch was ambiguous; refusing to build")
@@ -112,15 +162,15 @@ jobs:
                   dex_fix_count += 1
 
               script = script.replace(
-                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v14-single-pairip"
+                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v14-single-pairip-fix"
               )
               script = script.replace(
                   "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk",
-                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v14-single-pairip.apk",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v14-single-pairip-fix.apk",
               )
               script = script.replace(
                   "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5",
-                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v14-single-pairip",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v14-single-pairip-fix",
               )
               recipe_run_steps.append((step, script))
 
@@ -128,10 +178,13 @@ jobs:
               raise SystemExit(f"Expected exactly one PairIP loader patch; found {pairip_fix_count}")
           if dex_fix_count != 1:
               raise SystemExit(f"Expected exactly one ZIP verifier patch; found {dex_fix_count}")
+          if skipped_pairip_packager_count != 1:
+              raise SystemExit(f"Expected to skip exactly one launcher PairIP packaging step; found {skipped_pairip_packager_count}")
+          if verifier_pairip_fix_count != 1:
+              raise SystemExit(f"Expected exactly one no-duplicate-PairIP APK verifier patch; found {verifier_pairip_fix_count}")
 
           required_recipe_markers = (
-              "PAIRIP_B64_00",
-              "Bundle compressed ARMv7 PairIP dependency",
+              "Prepare PairIP ordering before the final runtime-loader patch",
               "Extract and preload PlayFab and Mae dependencies before Minecraft",
               "Load the Minecraft native dependency chain with a shared game-parent classloader",
               "Compile standalone DEX entrypoint for the game-parent native loader",
@@ -165,23 +218,6 @@ jobs:
                   if not f.is_file():
                       raise SystemExit(f"Required source file missing before build: {f}")
 
-              # The latest tombstone maps PairIP from BOTH this launcher APK and the
-              # installed Minecraft APK. PlayFab depends on libpairipcore.so and then
-              # faults at its own PLT base (0x1b5780) inside a native constructor.
-              # Keep official VMRunner initialization through packageContext.classLoader,
-              # but remove the duplicate launcher JNI copy so PlayFab cannot bind to it.
-              jni_root = workspace / "source/app/src/main/jniLibs"
-              pairip_copies = list(jni_root.rglob("libpairipcore.so")) if jni_root.is_dir() else []
-              if len(pairip_copies) != 1:
-                  raise SystemExit(
-                      f"Expected exactly one launcher JNI PairIP copy before de-duplication; found {len(pairip_copies)}"
-                  )
-              pairip_copies[0].unlink()
-              leftovers = list(jni_root.rglob("libpairipcore.so"))
-              if leftovers:
-                  raise SystemExit("A launcher JNI PairIP copy remains: " + ", ".join(map(str, leftovers)))
-              print("Removed launcher JNI PairIP duplicate; PlayFab will resolve against installed Minecraft's official PairIP.")
-
               kotlin = manager.read_text(encoding="utf-8")
 
               # v8/v10 tombstones show the cached PairIP and installed Minecraft
@@ -213,9 +249,11 @@ jobs:
                   raise SystemExit("Could not safely insert stale PairIP cache cleanup")
               kotlin = kotlin.replace(extraction_anchor, stale_pairip_cleanup, 1)
 
-              # Keep PairIP-dependent PlayFab/Mae on Minecraft's package ClassLoader,
-              # but bind libminecraftpe.so to GameActivity's defining ClassLoader. This
-              # preserves V14's PairIP namespace and the established native load order.
+              # Load all extracted Minecraft native libraries through the official
+              # Minecraft package ClassLoader, not an isolated helper DexClassLoader.
+              # Android 10's Runtime.load(String, ClassLoader) uses that exact loader's
+              # native-linker namespace. VMRunner initializes PairIP in this namespace
+              # first, so PlayFab's DT_NEEDED dependency reuses that same PairIP instance.
               # Runtime.load(String, ClassLoader) is private and explicitly rejects targetSdk > 24
               # on Android 10. This sideloaded Android-10-only candidate lowers targetSdk to 24
               # and verifies the packaged manifest so the private API's explicit precondition holds.
@@ -229,33 +267,7 @@ jobs:
                   if (!file.isFile || file.length() == 0L) {
                       throw UnsatisfiedLinkError("Native library is missing or empty: ${file.absolutePath}")
                   }
-                  val targetLoader = if (file.name == "libminecraftpe.so") {
-                      // Resolve both classes through Minecraft's PackageContext. A direct Kotlin
-                      // class reference here can resolve GameActivity from the launcher's loader,
-                      // not the copy that defines Minecraft's MainActivity.
-                      val gameActivityClass = Class.forName(
-                          "com.google.androidgamesdk.GameActivity",
-                          false,
-                          packageContext.classLoader
-                      )
-                      val mainActivityClass = Class.forName(
-                          "com.mojang.minecraftpe.MainActivity",
-                          false,
-                          packageContext.classLoader
-                      )
-                      val gameActivityLoader = gameActivityClass.classLoader
-                          ?: throw UnsatisfiedLinkError("Minecraft GameActivity defining ClassLoader is null")
-                      val mainActivityLoader = mainActivityClass.classLoader
-                          ?: throw UnsatisfiedLinkError("Minecraft MainActivity defining ClassLoader is null")
-                      if (gameActivityLoader !== mainActivityLoader) {
-                          throw UnsatisfiedLinkError(
-                              "Minecraft GameActivity and MainActivity use different ClassLoaders"
-                          )
-                      }
-                      gameActivityLoader
-                  } else {
-                      packageContext.classLoader
-                  }
+                  val targetLoader = packageContext.classLoader
                   val method = synchronized(runtimeNativeLoaderLock) {
                       runtimeNativeLoadMethod ?: java.lang.Runtime::class.java
                           .getDeclaredMethod("load", String::class.java, ClassLoader::class.java)
@@ -299,7 +311,7 @@ jobs:
               for marker in (
                   'getDeclaredMethod("load", String::class.java, ClassLoader::class.java)',
                   'method.invoke(java.lang.Runtime.getRuntime(), file.absolutePath, targetLoader)',
-                  'val targetLoader = if (file.name == "libminecraftpe.so") {',
+                  'val targetLoader = packageContext.classLoader',
                   'report("Loaded ${file.name} through Minecraft ClassLoader namespace")',
               ):
                   if marker not in native_method_text:
@@ -372,15 +384,8 @@ jobs:
                   raise SystemExit("PlayFab/Mae were still hard-coded ahead of Minecraft")
               if 'getDeclaredMethod("load", String::class.java, ClassLoader::class.java)' not in native_method_text:
                   raise SystemExit("The Android Runtime.load(path, classLoader) route is missing")
-              if 'val targetLoader = if (file.name == "libminecraftpe.so") {' not in native_method_text:
-                  raise SystemExit("libminecraftpe does not select GameActivity's defining ClassLoader")
-              for loader_marker in (
-                  'Class.forName(\n                          "com.google.androidgamesdk.GameActivity"',
-                  'Class.forName(\n                          "com.mojang.minecraftpe.MainActivity"',
-                  "packageContext.classLoader",
-              ):
-                  if loader_marker not in native_method_text:
-                      raise SystemExit("Native loader branch is incomplete; missing: " + loader_marker)
+              if "val targetLoader = packageContext.classLoader" not in native_method_text:
+                  raise SystemExit("Native libraries are not routed through Minecraft's actual ClassLoader")
               if "DexClassLoader(" in native_method_text:
                   raise SystemExit("An obsolete child-loader call remains inside the native-load method")
 
@@ -453,31 +458,8 @@ jobs:
                   raise SystemExit("The invalid early-return failure branch remains in MinecraftActivity")
               if "Log.getStackTraceString(throwable)" not in activity_text or "MinecraftActivity runtime preparation failed before super.onCreate" not in activity_text:
                   raise SystemExit("MinecraftActivity failure cause logging is incomplete")
-              old_super_failure_branch = "\n".join([
-                  "        } catch (throwable: Throwable) {",
-                  '            trace.error("Mojang MainActivity super.onCreate failed", formatLaunchFailure(throwable))',
-                  "            returnToLauncherAfterLaunchFailure()",
-                  "            return",
-                  "        }",
-              ])
-              new_super_failure_branch = "\n".join([
-                  "        } catch (throwable: Throwable) {",
-                  "            val fullStackTrace = android.util.Log.getStackTraceString(throwable)",
-                  '            trace.error("Mojang MainActivity super.onCreate failed", fullStackTrace)',
-                  '            android.util.Log.e("MinecraftActivity", "Mojang MainActivity.onCreate failed", throwable)',
-                  "            throw IllegalStateException(",
-                  '                "Mojang MainActivity.onCreate failed",',
-                  "                throwable",
-                  "            )",
-                  "        }",
-              ])
-              if activity_text.count(old_super_failure_branch) != 1:
-                  raise SystemExit("Could not uniquely patch Mojang MainActivity.onCreate catch")
-              activity_text = activity_text.replace(old_super_failure_branch, new_super_failure_branch, 1)
-              if 'trace.error("Mojang MainActivity super.onCreate failed", fullStackTrace)' not in activity_text:
-                  raise SystemExit("Full GameActivity exception stack trace logging is missing")
               activity.write_text(activity_text, encoding="utf-8")
-              print("Patched GameActivity startup exception reporting with the full Java/JNI cause.")
+              print("Patched MinecraftActivity's early-return catch to expose the underlying exception instead of masking it as SuperNotCalledException.")
 
               # Preserve the full Java cause when runtime preparation fails in the loading activity.
               # The previous candidate displayed only throwable.message, hiding the useful cause chain.
@@ -557,39 +539,6 @@ jobs:
                   )
                   print("Skipping only lintVitalDebug: targetSdk 24 is intentionally required for this Android 10 test candidate.")
               if name == "Verify the APK targets ARMv7":
-                  # This candidate intentionally removes PairIP from launcher jniLibs.
-                  # Change the inherited verifier to assert absence, not byte identity.
-                  pairip_arg = " 'source/app/src/main/jniLibs/armeabi-v7a/libpairipcore.so' <<'PY'"
-                  if script.count(pairip_arg) != 1:
-                      raise SystemExit("Could not isolate the original PairIP APK verifier")
-                  script = script.replace(pairip_arg, " <<'PY'", 1)
-                  old_expected_pairip = "expected_pairip = pathlib.Path(sys.argv[2]).read_bytes()\n"
-                  if script.count(old_expected_pairip) != 1:
-                      raise SystemExit("Expected PairIP source-hash verification line was not found")
-                  script = script.replace(old_expected_pairip, "", 1)
-                  old_required_pairip = "    'lib/armeabi-v7a/libpairipcore.so',\n"
-                  if script.count(old_required_pairip) != 1:
-                      raise SystemExit("Expected PairIP required-APK entry was not found")
-                  script = script.replace(old_required_pairip, "", 1)
-                  old_pairip_verify = "\n".join([
-                      "    packaged_pairip = z.read('lib/armeabi-v7a/libpairipcore.so')",
-                      "    if packaged_pairip != expected_pairip:",
-                      "        raise SystemExit('Packaged libpairipcore.so differs from the verified source; check that stripping/rewriting is disabled.')",
-                      "    if packaged_pairip[:4] != b'\\x7fELF' or packaged_pairip[4] != 1 or int.from_bytes(packaged_pairip[18:20], 'little') != 40:",
-                      "        raise SystemExit('Packaged libpairipcore.so is not a 32-bit ARM ELF')",
-                  ])
-                  if script.count(old_pairip_verify) != 1:
-                      raise SystemExit("Could not remove the obsolete packaged-PairIP byte check")
-                  script = script.replace(old_pairip_verify, "", 1)
-                  old_verify_print = "print('Verified ARMv7 gxcore, libc++, byte-identical PairIP, and runtime-loader DEX in', apk)"
-                  if script.count(old_verify_print) != 1:
-                      raise SystemExit("Could not update APK verification summary")
-                  new_verify_print = "\n".join([
-                      "if any(n.startswith('lib/') and n.endswith('/libpairipcore.so') for n in names):",
-                      "    raise SystemExit('Launcher APK still packages a duplicate libpairipcore.so')",
-                      "print('Verified ARMv7 gxcore/libc++, runtime-loader DEX, and absence of duplicate launcher PairIP in', apk)",
-                  ])
-                  script = script.replace(old_verify_print, new_verify_print, 1)
                   abi_marker = """grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt"""
                   if abi_marker not in script:
                       raise SystemExit("Could not add targetSdk manifest check to APK verification")
@@ -619,15 +568,15 @@ jobs:
           if run_count < 9:
               raise SystemExit(f"Too few shell steps were executed ({run_count}); refusing to call this build complete")
           if any_failed:
-              raise SystemExit("One or more v14 build steps failed; inspect the uploaded build log")
-          print("Build and static verification succeeded; launcher PairIP duplicate removed. Device launch remains unverified.")
+              raise SystemExit("One or more V14 single-PairIP build steps failed; inspect the uploaded build log")
+          print("Build/static verification succeeded; launcher PairIP duplication is checked, but device launch remains unverified.")
           PY
 
       - name: Upload full build log for diagnosis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: LeviLauncher-ARMv7-build-log-v14-single-pairip
+          name: LeviLauncher-ARMv7-build-log-v14-single-pairip-fix
           path: ${{ runner.temp }}/gradle-native-build.log
           if-no-files-found: warn
           retention-days: 7
@@ -636,7 +585,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v14-single-pairip
-          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v14-single-pairip.apk
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v14-single-pairip-fix
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v14-single-pairip-fix.apk
           if-no-files-found: error
           retention-days: 7
