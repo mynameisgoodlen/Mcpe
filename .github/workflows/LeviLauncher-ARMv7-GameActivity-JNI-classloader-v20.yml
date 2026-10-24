@@ -1,0 +1,305 @@
+name: Build LeviLauncher ARMv7 V20 unified JNI/ClassLoader fix APK (Android 10)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Mcpe workflow repository
+        uses: actions/checkout@v4
+
+      - name: Check out pinned LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: 38764ca77b4fcb9c27ab3cec688e67e5166141df
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Apply V20 unified JNI/ClassLoader fix and run V15 build recipe
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          v15_path = workspace / ".github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v15-shared-namespace-fix.yml"
+          if not v15_path.is_file():
+              raise SystemExit("V15 build recipe is missing from the Mcpe repository; refusing to guess the project build steps")
+
+          v15 = yaml.safe_load(v15_path.read_text(encoding="utf-8"))
+          jobs = v15.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected exactly one job in V15 workflow, got {len(jobs)}")
+          v15_steps = next(iter(jobs.values())).get("steps", [])
+          recipe = next((step for step in v15_steps if step.get("id") == "build" and "run" in step), None)
+          if recipe is None:
+              raise SystemExit("Could not find V15 build step with id=build; refusing to guess")
+
+          script = recipe["run"]
+          patch_anchor = '    print("Pre-build checks passed: native loader patch applied; Activity failure now preserves the original exception; debug R8 is disabled; targetSdk is 24 for Android 10 compatibility testing.")\n'
+          if script.count(patch_anchor) != 1:
+              raise SystemExit("Could not uniquely locate V15 pre-build validation block")
+
+          # V20 retains the working GameActivity JNI link fix, but addresses the new
+          # runtime crash: Mojang MainActivity native methods were looked up from
+          # the launcher ClassLoader while libminecraftpe.so was assigned to the
+          # separate installed-Minecraft ClassLoader.
+          game_activity_patch = r'''
+              # V20: The V20 crash shows MainActivity JNI is looked up from the
+              # launcher's ClassLoader, while V15-V20 loaded libminecraftpe.so into
+              # packageContext.classLoader. Unify PairIP and Minecraft native loading
+              # with the loader that actually defines com.mojang.minecraftpe.MainActivity.
+              cmake_text = cmake.read_text(encoding="utf-8")
+              if "game-activity::game-activity_static" not in cmake_text:
+                  link_anchor = "add_subdirectory(preloader)"
+                  if cmake_text.count(link_anchor) != 1:
+                      raise SystemExit("Could not uniquely locate add_subdirectory(preloader) for GameActivity link")
+                  cmake_replacement = "\n".join([
+                      "find_package(game-activity REQUIRED CONFIG)",
+                      "add_subdirectory(preloader)",
+                      "target_link_libraries(preloader PRIVATE game-activity::game-activity_static)",
+                  ])
+                  cmake_text = cmake_text.replace(link_anchor, cmake_replacement, 1)
+
+              link_line = "target_link_libraries(preloader PRIVATE game-activity::game-activity_static)"
+              force_symbol = 'target_link_options(preloader PRIVATE "LINKER:-u,Java_com_google_androidgamesdk_GameActivity_initializeNativeCode")'
+              if link_line not in cmake_text:
+                  raise SystemExit("GameActivity target link is missing; refusing to patch an unknown CMake layout")
+              if force_symbol not in cmake_text:
+                  cmake_text = cmake_text.replace(link_line, link_line + "\n" + force_symbol, 1)
+              cmake.write_text(cmake_text, encoding="utf-8")
+              if cmake_text.count("game-activity::game-activity_static") != 1:
+                  raise SystemExit("GameActivity static library link is missing or duplicated")
+              if cmake_text.count("Java_com_google_androidgamesdk_GameActivity_initializeNativeCode") != 1:
+                  raise SystemExit("GameActivity JNI linker-retention option is missing or duplicated")
+
+              # Keep native_app_glue's required symbol satisfied. This is not the
+              # application's entry point; the Java Activity drives startup.
+              preloader_cpp = workspace / "source/app/src/main/cpp/preloader/src/pl/PreLoader.cpp"
+              if not preloader_cpp.is_file():
+                  raise SystemExit(f"Native preloader source is missing: {preloader_cpp}")
+              preloader_text = preloader_cpp.read_text(encoding="utf-8")
+              stub = '\nextern "C" void android_main(struct android_app *app) { (void)app; }\n'
+              if 'extern "C" void android_main(struct android_app *app)' not in preloader_text:
+                  include_anchor = '#include "pl/runtime/ModMenuBridge.h"\n'
+                  if preloader_text.count(include_anchor) != 1:
+                      raise SystemExit("Could not safely insert android_main link fallback")
+                  preloader_text = preloader_text.replace(include_anchor, include_anchor + stub, 1)
+              preloader_cpp.write_text(preloader_text, encoding="utf-8")
+
+              # V20 source patch: keep the byte-identical PairIP library in the runtime
+              # cache, but initialize it from the SAME loader as MainActivity. That avoids
+              # the V20 JNI mismatch and V14's split PairIP namespaces.
+              manager_path = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              if not manager_path.is_file():
+                  raise SystemExit(f"GamePackageManager source is missing: {manager_path}")
+              kotlin_text = manager_path.read_text(encoding="utf-8")
+
+              # Restore PairIP to the extraction dependency list. It will be loaded only
+              # through the launcher's namespace; it is NOT bundled as a second JNI copy.
+              deps_pattern = re.compile(r'(?ms)^    private val runtimeDependencyLibs = arrayOf\(\n.*?^    \)')
+              deps_match = deps_pattern.search(kotlin_text)
+              if not deps_match:
+                  raise SystemExit("Could not locate runtimeDependencyLibs for unified-loader patch")
+              deps_block = deps_match.group(0)
+              if '"libpairipcore.so"' not in deps_block:
+                  deps_block = deps_block.replace(
+                      "private val runtimeDependencyLibs = arrayOf(\n",
+                      'private val runtimeDependencyLibs = arrayOf(\n        "libpairipcore.so",\n',
+                      1,
+                  )
+                  kotlin_text = kotlin_text[:deps_match.start()] + deps_block + kotlin_text[deps_match.end():]
+
+              # Native methods are resolved against the defining ClassLoader of the active
+              # MainActivity. Using packageContext.classLoader registers natives on a second,
+              # same-named MainActivity class from the installed Minecraft package instead.
+              native_pattern = re.compile(
+                  r'(?ms)^    private fun loadRuntimeNativeLibrary\(file: File\) \{\n.*?^    \}'
+              )
+              native_match = native_pattern.search(kotlin_text)
+              if not native_match:
+                  raise SystemExit("Could not locate loadRuntimeNativeLibrary for V20")
+              native_body = native_match.group(0)
+              old_target = "val targetLoader = packageContext.classLoader"
+              new_target = "val targetLoader = com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader"
+              if old_target in native_body:
+                  native_body = native_body.replace(old_target, new_target, 1)
+              elif new_target not in native_body:
+                  raise SystemExit("Native loader has an unexpected target ClassLoader; refusing to guess")
+              native_body = native_body.replace("Minecraft ClassLoader namespace", "launcher/MainActivity ClassLoader namespace")
+              native_body = native_body.replace("Minecraft ClassLoader ${targetLoader.javaClass.name}", "MainActivity ClassLoader ${targetLoader.javaClass.name}")
+              kotlin_text = kotlin_text[:native_match.start()] + native_body + kotlin_text[native_match.end():]
+
+              # Extend the launcher's existing PathClassLoader with the installed game's APK
+              # DEX/native search paths. The launcher's own DEX stays first, so its active
+              # MainActivity keeps the same Class identity while PairIP VMRunner can be found
+              # by that very same loader. No child DexClassLoader is introduced.
+              prepare_method_lines = [
+                  "    private fun prepareLauncherClassLoaderForMinecraft() {",
+                  "        val launcherLoader = com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader",
+                  "        val baseDexClassLoader = Class.forName(\"dalvik.system.BaseDexClassLoader\")",
+                  "        if (!baseDexClassLoader.isInstance(launcherLoader)) {",
+                  "            throw IllegalStateException(\"MainActivity does not use BaseDexClassLoader: ${launcherLoader.javaClass.name}\")",
+                  "        }",
+                  "        val addDexPath = baseDexClassLoader.getDeclaredMethod(\"addDexPath\", String::class.java).apply { isAccessible = true }",
+                  "        val addNativePath = baseDexClassLoader.getDeclaredMethod(\"addNativePath\", java.util.Collection::class.java).apply { isAccessible = true }",
+                  "        val gameInfo = packageContext.applicationInfo",
+                  "        val apkPaths = buildList {",
+                  "            gameInfo.sourceDir?.let { add(it) }",
+                  "            gameInfo.splitSourceDirs?.forEach { add(it) }",
+                  "            gameInfo.splitPublicSourceDirs?.forEach { add(it) }",
+                  "        }.distinct().filter { File(it).isFile }",
+                  "        if (apkPaths.isEmpty()) throw IllegalStateException(\"No installed Minecraft APK paths are accessible\")",
+                  "        apkPaths.forEach { addDexPath.invoke(launcherLoader, it) }",
+                  "        val cacheDir = File(nativeLibDir)",
+                  "        if (!cacheDir.isDirectory && !cacheDir.mkdirs()) throw IllegalStateException(\"Cannot create Minecraft native cache: ${cacheDir.absolutePath}\")",
+                  "        val nativePaths = listOf(nativeLibDir, gameInfo.nativeLibraryDir, context.applicationInfo.nativeLibraryDir)",
+                  "            .filter { it.isNotBlank() && File(it).isDirectory }.distinct()",
+                  "        if (nativePaths.isEmpty()) throw IllegalStateException(\"No native library search paths are accessible\")",
+                  "        addNativePath.invoke(launcherLoader, nativePaths)",
+                  "        val pairIpClass = Class.forName(\"com.pairip.VMRunner\", false, launcherLoader)",
+                  "        if (pairIpClass.classLoader !== launcherLoader) throw IllegalStateException(\"PairIP VMRunner resolved from a different ClassLoader\")",
+                  "        report(\"Unified Minecraft Java/native loader: MainActivity=${launcherLoader.javaClass.name}, APKs=${apkPaths.size}, nativePaths=${nativePaths.size}\")",
+                  "    }",
+                  "",
+              ]
+              prepare_method = "\n".join(prepare_method_lines)
+              if "private fun prepareLauncherClassLoaderForMinecraft()" not in kotlin_text:
+                  setup_anchor = "    private fun setupSecurityProvider() {\n"
+                  if kotlin_text.count(setup_anchor) != 1:
+                      raise SystemExit("Could not safely insert launcher ClassLoader preparation method")
+                  kotlin_text = kotlin_text.replace(setup_anchor, prepare_method + setup_anchor, 1)
+
+              init_anchor = '        extractLibraries()\n        report("Creating AssetManager")'
+              if kotlin_text.count(init_anchor) == 1:
+                  kotlin_text = kotlin_text.replace(
+                      init_anchor,
+                      '        prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()\n        report("Creating AssetManager")',
+                      1,
+                  )
+              elif "prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()" not in kotlin_text:
+                  raise SystemExit("Could not safely call launcher ClassLoader preparation before extraction")
+
+              # PairIP VMRunner must initialize via MainActivity's loader too, ensuring its
+              # native load goes into the same Android linker namespace as libminecraftpe.so.
+              old_pairip_init = 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)'
+              new_pairip_init = 'Class.forName("com.pairip.VMRunner", true, com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader)'
+              if old_pairip_init in kotlin_text:
+                  kotlin_text = kotlin_text.replace(old_pairip_init, new_pairip_init, 1)
+              elif new_pairip_init not in kotlin_text:
+                  raise SystemExit("Could not safely retarget official PairIP initialization to MainActivity's ClassLoader")
+              if '"libpairipcore.so"' not in deps_pattern.search(kotlin_text).group(0):
+                  raise SystemExit("PairIP is not present in the final extraction dependency list")
+              if new_target not in native_pattern.search(kotlin_text).group(0):
+                  raise SystemExit("Native libraries are not routed through MainActivity's ClassLoader")
+              if "prepareLauncherClassLoaderForMinecraft()" not in kotlin_text:
+                  raise SystemExit("Launcher ClassLoader preparation is missing")
+              manager_path.write_text(kotlin_text, encoding="utf-8")
+              print("V20 applied: MainActivity, PairIP, PlayFab/Mae, and libminecraftpe native loads share the launcher ClassLoader namespace.")
+          '''
+          script = script.replace(patch_anchor, game_activity_patch + patch_anchor, 1)
+
+          # Verify the actual exported dynamic symbol in the packaged ARMv7 library.
+          # Do not search for the Java method descriptor in ELF strings: it belongs to
+          # the Java/Dex class metadata and need not be embedded in the native library.
+          verify_anchor = '        script = script.replace(abi_marker, target_sdk_checks, 1)\n'
+          if script.count(verify_anchor) != 1:
+              raise SystemExit("Could not uniquely locate V15 APK verification insertion point")
+          verify_patch = r'''
+                  script = script.replace(abi_marker, target_sdk_checks, 1)
+                  script += r"""
+          set -euo pipefail
+          APK="LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v20-unified-classloader.apk"
+          NATIVE="$RUNNER_TEMP/v20-libpreloader.so"
+          unzip -p "$APK" lib/armeabi-v7a/libpreloader.so > "$NATIVE"
+          test -s "$NATIVE"
+          if ! readelf --dyn-syms --wide "$NATIVE" | awk '
+            $4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" &&
+            $8 == "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode" { found = 1 }
+            END { exit !found }
+          '; then
+              echo "::error::libpreloader.so does not export GameActivity.initializeNativeCode."
+              readelf --dyn-syms --wide "$NATIVE" | grep -E 'GameActivity|initializeNativeCode' || true
+              exit 1
+          fi
+          # The Java descriptor is part of GameActivity's DEX/class metadata, not
+          # guaranteed to appear in the native ELF string table. Do not reject a
+          # valid native export based on that invalid assumption.
+          echo "Verified: GameActivity.initializeNativeCode is a defined global function in the packaged ARMv7 ELF."
+          """
+          '''
+          script = script.replace(verify_anchor, verify_patch, 1)
+
+          # Ensure unique V20 artifact names; V20 deliberately replaces the V15 split
+          # ClassLoader selection with one loader for MainActivity, PairIP, and game natives.
+          script = script.replace("v15-single-pairip", "v20-unified-classloader")
+          script = script.replace("v15 single-PairIP", "v20 GameActivity JNI entrypoint")
+          script = script.replace(
+              "Build and static verification succeeded; launcher PairIP duplicate removed. Device launch remains unverified.",
+              "Build and static verification succeeded; GameActivity JNI export verified. Device launch remains unverified.",
+          )
+
+          child_env = os.environ.copy()
+          for key, value in (recipe.get("env") or {}).items():
+              child_env[str(key)] = str(value)
+          result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=workspace, env=child_env)
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          PY
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v20-unified-classloader
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload V20 ARMv7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v20-unified-classloader
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v20-unified-classloader.apk
+          if-no-files-found: error
+          retention-days: 7
