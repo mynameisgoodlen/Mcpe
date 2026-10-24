@@ -1,0 +1,414 @@
+name: Build LeviLauncher ARMv7 V22 PlayFab PLT relocation and JNI fix APK (Android 10)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Mcpe workflow repository
+        uses: actions/checkout@v4
+
+      - name: Check out pinned LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: 38764ca77b4fcb9c27ab3cec688e67e5166141df
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Fetch and validate official PlayFab v1.8.4 DynLHC ARMv7 replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$RUNNER_TEMP/playfab-android-v1.8.4-dynlhc.zip"
+          ROOT="$RUNNER_TEMP/playfab-android-v1.8.4-dynlhc"
+          URL="https://github.com/PlayFab/PlayFabMultiplayer/releases/download/v1.8.4/Microsoft.PlayFab.PlayFabMultiplayer.Cpp.AndroidRelease.DynLHC.zip"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 "$URL" -o "$ZIP"
+          echo "a3ce82eaffe52bd11499c57de9324f41f6d0566ee6c37c004f80c6e38dc8e0d3  $ZIP" | sha256sum -c -
+          python3 - "$ZIP" "$ROOT" "$GITHUB_WORKSPACE/source/app/src/main/assets/native_patches/armeabi-v7a/libPlayFabMultiplayer.so" <<'PY_PLAYFAB'
+          from pathlib import Path, PurePosixPath
+          import hashlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import zipfile
+
+          archive = Path(sys.argv[1])
+          root = Path(sys.argv[2])
+          output = Path(sys.argv[3])
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              candidates = [n for n in zf.namelist()
+                            if PurePosixPath(n).name == "libPlayFabMultiplayer.so"
+                            and "armeabi-v7a" in n.lower()]
+              if len(candidates) != 1:
+                  names = "\n".join(n for n in zf.namelist()
+                                    if PurePosixPath(n).name == "libPlayFabMultiplayer.so")
+                  raise SystemExit(
+                      "Expected exactly one official armeabi-v7a/libPlayFabMultiplayer.so in PlayFab v1.8.4 package; "
+                      f"found {len(candidates)}. All matching library paths:\n{names}"
+                  )
+              payload = zf.read(candidates[0])
+
+          staged = root / "libPlayFabMultiplayer.so"
+          staged.write_bytes(payload)
+          header = subprocess.run(["readelf", "-h", str(staged)], check=True,
+                                  capture_output=True, text=True).stdout
+          if not re.search(r"Class:\s+ELF32", header) or not re.search(r"Machine:\s+ARM", header):
+              raise SystemExit("Selected PlayFab binary is not a 32-bit ARM ELF; refusing to package it")
+          dynamic = subprocess.run(["readelf", "-d", str(staged)], check=True,
+                                   capture_output=True, text=True).stdout
+          relocations = subprocess.run(["readelf", "-rW", str(staged)], check=True,
+                                       capture_output=True, text=True).stdout
+          if "JMPREL" not in dynamic or "PLTRELSZ" not in dynamic or "JUMP_SLOT" not in relocations:
+              raise SystemExit("PlayFab replacement lacks an ordinary dynamic PLT relocation table; refusing to package it")
+          if "getauxval" not in relocations:
+              raise SystemExit("PlayFab replacement does not expose the getauxval relocation implicated by the tombstone; refusing to package it")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile(staged, output)
+          print(f"Selected official asset member: {candidates[0]}")
+          print(f"Packaged ARMv7 PlayFab replacement: {output} ({output.stat().st_size} bytes)")
+          print(f"PlayFab v1.8.4 DynLHC ARMv7 SHA-256: {hashlib.sha256(payload).hexdigest()}")
+          PY_PLAYFAB
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Apply V22 PlayFab PLT relocation, MainActivity JNI, and native dependency-order fix based on the V15 recipe
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          v15_path = workspace / ".github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v15-shared-namespace-fix.yml"
+          if not v15_path.is_file():
+              raise SystemExit("V15 build recipe is missing from the Mcpe repository; refusing to guess the project build steps")
+
+          v15 = yaml.safe_load(v15_path.read_text(encoding="utf-8"))
+          jobs = v15.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected exactly one job in V15 workflow, got {len(jobs)}")
+          v15_steps = next(iter(jobs.values())).get("steps", [])
+          recipe = next((step for step in v15_steps if step.get("id") == "build" and "run" in step), None)
+          if recipe is None:
+              raise SystemExit("Could not find V15 build step with id=build; refusing to guess")
+
+          script = recipe["run"]
+          patch_anchor = '    print("Pre-build checks passed: native loader patch applied; Activity failure now preserves the original exception; debug R8 is disabled; targetSdk is 24 for Android 10 compatibility testing.")\n'
+          if script.count(patch_anchor) != 1:
+              raise SystemExit("Could not uniquely locate V15 pre-build validation block")
+
+          # V22: link the AndroidX GameActivity implementation into libpreloader.so.
+          # Force its exact Java JNI entrypoint to survive --gc-sections. V17 called
+          # GameActivity_register from JNI_OnLoad, but that did not retain the separate
+          # Java_* wrapper and its post-build check correctly failed.
+          game_activity_patch = r'''
+              # V22: keep the proven GameActivity link fix and correct the separate
+              # MainActivity JNI/class-loader mismatch plus native dependency order.
+              cmake_text = cmake.read_text(encoding="utf-8")
+              if "game-activity::game-activity_static" not in cmake_text:
+                  link_anchor = "add_subdirectory(preloader)"
+                  if cmake_text.count(link_anchor) != 1:
+                      raise SystemExit("Could not uniquely locate add_subdirectory(preloader) for GameActivity link")
+                  cmake_replacement = "\n".join([
+                      "find_package(game-activity REQUIRED CONFIG)",
+                      "add_subdirectory(preloader)",
+                      "target_link_libraries(preloader PRIVATE game-activity::game-activity_static)",
+                  ])
+                  cmake_text = cmake_text.replace(link_anchor, cmake_replacement, 1)
+              link_line = "target_link_libraries(preloader PRIVATE game-activity::game-activity_static)"
+              force_symbol = 'target_link_options(preloader PRIVATE "LINKER:-u,Java_com_google_androidgamesdk_GameActivity_initializeNativeCode")'
+              if link_line not in cmake_text:
+                  raise SystemExit("GameActivity target link is missing; refusing to patch an unknown CMake layout")
+              if force_symbol not in cmake_text:
+                  cmake_text = cmake_text.replace(link_line, link_line + "\n" + force_symbol, 1)
+              cmake.write_text(cmake_text, encoding="utf-8")
+              if cmake_text.count("game-activity::game-activity_static") != 1 or cmake_text.count("Java_com_google_androidgamesdk_GameActivity_initializeNativeCode") != 1:
+                  raise SystemExit("GameActivity static link or JNI retention option is missing/duplicated")
+
+              preloader_cpp = workspace / "source/app/src/main/cpp/preloader/src/pl/PreLoader.cpp"
+              if not preloader_cpp.is_file():
+                  raise SystemExit(f"Native preloader source is missing: {preloader_cpp}")
+              preloader_text = preloader_cpp.read_text(encoding="utf-8")
+              stub = '\nextern "C" void android_main(struct android_app *app) { (void)app; }\n'
+              if 'extern "C" void android_main(struct android_app *app)' not in preloader_text:
+                  include_anchor = '#include "pl/runtime/ModMenuBridge.h"\n'
+                  if preloader_text.count(include_anchor) != 1:
+                      raise SystemExit("Could not safely insert android_main link fallback")
+                  preloader_text = preloader_text.replace(include_anchor, include_anchor + stub, 1)
+              preloader_cpp.write_text(preloader_text, encoding="utf-8")
+
+              # Evidence from the user-supplied V15 APK: MainActivity is present in
+              # launcher classes*.dex. Loading libminecraftpe.so through the separate
+              # installed-game ClassLoader registers/finds natives against the wrong
+              # same-named MainActivity class. Use the defining loader of our MainActivity.
+              manager_path = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              if not manager_path.is_file():
+                  raise SystemExit(f"GamePackageManager source is missing: {manager_path}")
+              kotlin_text = manager_path.read_text(encoding="utf-8")
+
+              # PairIP must be extracted from the official installed Minecraft APKs,
+              # but loaded only through the launcher/MainActivity namespace (no bundled duplicate).
+              v22_deps_pattern = re.compile(r'(?ms)^    private val runtimeDependencyLibs = arrayOf\(\n.*?^    \)')
+              v22_deps_match = v22_deps_pattern.search(kotlin_text)
+              if not v22_deps_match:
+                  raise SystemExit("Could not locate runtimeDependencyLibs")
+              v22_deps_block = v22_deps_match.group(0)
+              if '"libpairipcore.so"' not in v22_deps_block:
+                  v22_deps_block = v22_deps_block.replace(
+                      "private val runtimeDependencyLibs = arrayOf(\n",
+                      'private val runtimeDependencyLibs = arrayOf(\n        "libpairipcore.so",\n', 1)
+                  kotlin_text = kotlin_text[:v22_deps_match.start()] + v22_deps_block + kotlin_text[v22_deps_match.end():]
+
+              v22_native_pattern = re.compile(r'(?ms)^    private fun loadRuntimeNativeLibrary\(file: File\) \{\n.*?^    \}')
+              v22_native_match = v22_native_pattern.search(kotlin_text)
+              if not v22_native_match:
+                  raise SystemExit("Could not locate loadRuntimeNativeLibrary")
+              v22_native_body = v22_native_match.group(0)
+              v22_old_target = "val targetLoader = packageContext.classLoader"
+              v22_new_target = "val targetLoader = com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader"
+              if v22_old_target in v22_native_body:
+                  v22_native_body = v22_native_body.replace(v22_old_target, v22_new_target, 1)
+              elif v22_new_target not in v22_native_body:
+                  raise SystemExit("Native loader has an unexpected target ClassLoader")
+              v22_native_body = v22_native_body.replace("Minecraft ClassLoader namespace", "MainActivity ClassLoader namespace")
+              v22_native_body = v22_native_body.replace("Minecraft ClassLoader ${targetLoader.javaClass.name}", "MainActivity ClassLoader ${targetLoader.javaClass.name}")
+              kotlin_text = kotlin_text[:v22_native_match.start()] + v22_native_body + kotlin_text[v22_native_match.end():]
+
+              # Add the installed Minecraft APK DEX/native search paths to the launcher's
+              # PathClassLoader. Launcher DEX stays first so MainActivity class identity remains.
+              v22_prepare_lines = [
+                  "    private fun prepareLauncherClassLoaderForMinecraft() {",
+                  "        val launcherLoader = com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader",
+                  '        val baseDexClassLoader = Class.forName("dalvik.system.BaseDexClassLoader")',
+                  '        if (!baseDexClassLoader.isInstance(launcherLoader)) throw IllegalStateException("MainActivity does not use BaseDexClassLoader: ${launcherLoader.javaClass.name}")',
+                  '        val addDexPath = baseDexClassLoader.getDeclaredMethod("addDexPath", String::class.java).apply { isAccessible = true }',
+                  '        val addNativePath = baseDexClassLoader.getDeclaredMethod("addNativePath", java.util.Collection::class.java).apply { isAccessible = true }',
+                  "        val gameInfo = packageContext.applicationInfo",
+                  "        val apkPaths = buildList { gameInfo.sourceDir?.let { add(it) }; gameInfo.splitSourceDirs?.forEach { add(it) }; gameInfo.splitPublicSourceDirs?.forEach { add(it) } }.distinct().filter { File(it).isFile }",
+                  '        if (apkPaths.isEmpty()) throw IllegalStateException("No installed Minecraft APK paths are accessible")',
+                  "        apkPaths.forEach { addDexPath.invoke(launcherLoader, it) }",
+                  "        val cacheDir = File(nativeLibDir)",
+                  '        if (!cacheDir.isDirectory && !cacheDir.mkdirs()) throw IllegalStateException("Cannot create Minecraft native cache: ${cacheDir.absolutePath}")',
+                  "        val nativePaths = listOf(nativeLibDir, gameInfo.nativeLibraryDir, context.applicationInfo.nativeLibraryDir).filter { it.isNotBlank() && File(it).isDirectory }.distinct()",
+                  '        if (nativePaths.isEmpty()) throw IllegalStateException("No native library search paths are accessible")',
+                  "        addNativePath.invoke(launcherLoader, nativePaths)",
+                  '        val pairIpClass = Class.forName("com.pairip.VMRunner", false, launcherLoader)',
+                  '        if (pairIpClass.classLoader !== launcherLoader) throw IllegalStateException("PairIP VMRunner resolved from a different ClassLoader")',
+                  '        report("MainActivity loader prepared: ${launcherLoader.javaClass.name}, APKs=${apkPaths.size}, nativePaths=${nativePaths.size}")',
+                  "    }",
+                  "",
+              ]
+              v22_prepare_method = "\n".join(v22_prepare_lines)
+              if "private fun prepareLauncherClassLoaderForMinecraft()" not in kotlin_text:
+                  v22_setup_anchor = "    private fun setupSecurityProvider() {\n"
+                  if kotlin_text.count(v22_setup_anchor) != 1:
+                      raise SystemExit("Could not locate setupSecurityProvider for classloader preparation")
+                  kotlin_text = kotlin_text.replace(v22_setup_anchor, v22_prepare_method + v22_setup_anchor, 1)
+              v22_init_anchor = '        extractLibraries()\n        report("Creating AssetManager")'
+              if v22_init_anchor in kotlin_text:
+                  kotlin_text = kotlin_text.replace(v22_init_anchor, '        prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()\n        report("Creating AssetManager")', 1)
+              elif "prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()" not in kotlin_text:
+                  raise SystemExit("Could not call classloader preparation before library extraction")
+
+              # PairIP Java initialization must use the same loader as MainActivity and native loads.
+              v22_old_pairip = 'Class.forName("com.pairip.VMRunner", true, packageContext.classLoader)'
+              v22_new_pairip = 'Class.forName("com.pairip.VMRunner", true, com.mojang.minecraftpe.MainActivity::class.java.classLoader ?: context.classLoader)'
+              if v22_old_pairip in kotlin_text:
+                  kotlin_text = kotlin_text.replace(v22_old_pairip, v22_new_pairip, 1)
+              elif v22_new_pairip not in kotlin_text:
+                  raise SystemExit("Could not retarget official PairIP initialization to MainActivity's loader")
+
+              # Critical dependency order for the DynLHC SDK replacement: libc++, PairIP,
+              # Minecraft's own HTTP library, PlayFab, Mae, then libminecraftpe.so. The
+              # DynLHC build intentionally resolves libHttpClient dynamically, so load it
+              # before PlayFab rather than relying on a namespace search during constructors.
+              v22_order_pattern = re.compile(r'(?ms)^[ \t]*val allLibs = buildList \{\n.*?^[ \t]*\}\.distinct\(\)')
+              v22_order_replacement = """        val allLibs = buildList {
+                          add("libc++_shared.so")
+                          add("libpairipcore.so")
+                          requiredLibs.filterNot { it == "libc++_shared.so" || it == "libminecraftpe.so" }.forEach { add(it) }
+                          optionalLibs.forEach { add(it) }
+                          add("libPlayFabMultiplayer.so")
+                          add("libmaesdk.so")
+                          add("libminecraftpe.so")
+                          systemLoadedLibs.filterNot { it == "libpairipcore.so" || it == "libPlayFabMultiplayer.so" || it == "libmaesdk.so" }.forEach { add(it) }
+                      }.distinct()"""
+              kotlin_text, v22_order_count = v22_order_pattern.subn(v22_order_replacement, kotlin_text, count=1)
+              if v22_order_count != 1:
+                  raise SystemExit(f"Could not uniquely enforce native dependency order; found {v22_order_count}")
+              v22_order_start = kotlin_text.find("val allLibs = buildList {")
+              v22_order_end = kotlin_text.find("}.distinct()", v22_order_start)
+              v22_order_block = kotlin_text[v22_order_start:v22_order_end]
+              v22_pairip_pos = v22_order_block.find('add("libpairipcore.so")')
+              v22_http_pos = v22_order_block.find("optionalLibs.forEach { add(it) }")
+              v22_playfab_pos = v22_order_block.find('add("libPlayFabMultiplayer.so")')
+              v22_mae_pos = v22_order_block.find('add("libmaesdk.so")')
+              v22_minecraft_pos = v22_order_block.find('add("libminecraftpe.so")')
+              if any(pos < 0 for pos in [v22_pairip_pos, v22_http_pos, v22_playfab_pos, v22_mae_pos, v22_minecraft_pos]) or not (v22_pairip_pos < v22_http_pos < v22_playfab_pos < v22_mae_pos < v22_minecraft_pos):
+                  raise SystemExit("Native dependency order validation failed; PairIP/HttpClient/PlayFab/Mae must precede libminecraftpe.so in the required order")
+
+              # The user's trace faults at libPlayFabMultiplayer.so+0x1b5780 while
+              # the constructor is running. Upstream identified this crash pattern as a
+              # protected/missing ordinary PLT relocation. Overlay the official PlayFab
+              # v1.8.4 ARMv7 binary over the extracted protected game copy before any loads.
+              v22_installer_lines = [
+                  "    private fun installPlayFabCompatibilityLibrary() {",
+                  '        if (getDeviceAbi() != "armeabi-v7a") throw IllegalStateException("V22 PlayFab replacement is ARMv7-only; detected ABI=${getDeviceAbi()}")',
+                  '        val assetName = "native_patches/armeabi-v7a/libPlayFabMultiplayer.so"',
+                  '        val target = File(nativeLibDir, "libPlayFabMultiplayer.so")',
+                  '        val temporary = File(nativeLibDir, "libPlayFabMultiplayer.so.v22.tmp")',
+                  '        try {',
+                  '            if (temporary.exists() && !temporary.delete()) throw IOException("Cannot remove stale PlayFab replacement temp file: ${temporary.absolutePath}")',
+                  '            context.assets.open(assetName).use { input ->',
+                  '                FileOutputStream(temporary).use { output ->',
+                  '                    input.copyTo(output)',
+                  '                    output.fd.sync()',
+                  '                }',
+                  '            }',
+                  '            if (!temporary.isFile || temporary.length() < 4096L) throw IOException("Packaged PlayFab compatibility asset is missing or too small: ${temporary.absolutePath}")',
+                  '            ensureReadOnly(temporary)',
+                  '            if (target.exists() && !target.delete()) throw IOException("Cannot replace cached game PlayFab binary: ${target.absolutePath}")',
+                  '            if (!temporary.renameTo(target)) throw IOException("Cannot install PlayFab compatibility binary: ${target.absolutePath}")',
+                  '            ensureReadOnly(target)',
+                  '            report("Installed PlayFab v1.8.4 DynLHC ARMv7 relocation-compatible library: ${target.absolutePath}, bytes=${target.length()}")',
+                  '        } catch (error: Throwable) {',
+                  '            temporary.delete()',
+                  '            report("PlayFab compatibility replacement failed: ${error.message ?: error.javaClass.simpleName}")',
+                  '            throw IllegalStateException("Cannot install PlayFab v1.8.4 DynLHC compatibility library before native loading", error)',
+                  '        }',
+                  '    }',
+                  '',
+              ]
+              v22_installer_method = "\n".join(v22_installer_lines)
+              if "private fun installPlayFabCompatibilityLibrary()" not in kotlin_text:
+                  v22_setup_anchor = "    private fun setupSecurityProvider() {\n"
+                  if kotlin_text.count(v22_setup_anchor) != 1:
+                      raise SystemExit("Could not safely insert PlayFab compatibility installer method")
+                  kotlin_text = kotlin_text.replace(v22_setup_anchor, v22_installer_method + "\n" + v22_setup_anchor, 1)
+              v22_init_anchor = '        prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()\n        report("Creating AssetManager")'
+              v22_init_replacement = '        prepareLauncherClassLoaderForMinecraft()\n        extractLibraries()\n        installPlayFabCompatibilityLibrary()\n        report("Creating AssetManager")'
+              if v22_init_anchor in kotlin_text:
+                  kotlin_text = kotlin_text.replace(v22_init_anchor, v22_init_replacement, 1)
+              elif '        installPlayFabCompatibilityLibrary()\n        report("Creating AssetManager")' not in kotlin_text:
+                  raise SystemExit("Could not ensure PlayFab replacement is installed after extraction and before native loading")
+              if "private fun installPlayFabCompatibilityLibrary()" not in kotlin_text:
+                  raise SystemExit("PlayFab installer method failed source verification")
+
+              manager_path.write_text(kotlin_text, encoding="utf-8")
+              print("V22 applied: GameActivity JNI retained; MainActivity native loading unified; official PlayFab v1.8.4 DynLHC ARMv7 replacement installed before native loading.")
+          '''
+          script = script.replace(patch_anchor, game_activity_patch + patch_anchor, 1)
+
+          # Verify the actual exported dynamic symbol in the packaged ARMv7 library.
+          # Do not search for the Java method descriptor in ELF strings: it belongs to
+          # the Java/Dex class metadata and need not be embedded in the native library.
+          verify_anchor = '        script = script.replace(abi_marker, target_sdk_checks, 1)\n'
+          if script.count(verify_anchor) != 1:
+              raise SystemExit("Could not uniquely locate V15 APK verification insertion point")
+          verify_patch = r'''
+                  script = script.replace(abi_marker, target_sdk_checks, 1)
+                  script += r"""
+          set -euo pipefail
+          APK="LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v22-playfab-plt-fix.apk"
+          NATIVE="$RUNNER_TEMP/v22-libpreloader.so"
+          unzip -p "$APK" lib/armeabi-v7a/libpreloader.so > "$NATIVE"
+          test -s "$NATIVE"
+          if ! readelf --dyn-syms --wide "$NATIVE" | awk '
+            $4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" &&
+            $8 == "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode" { found = 1 }
+            END { exit !found }
+          '; then
+              echo "::error::libpreloader.so does not export GameActivity.initializeNativeCode."
+              readelf --dyn-syms --wide "$NATIVE" | grep -E 'GameActivity|initializeNativeCode' || true
+              exit 1
+          fi
+          # The Java descriptor is part of GameActivity's DEX/class metadata, not
+          # guaranteed to appear in the native ELF string table. Do not reject a
+          # valid native export based on that invalid assumption.
+          PLAYFAB="$RUNNER_TEMP/v22-libPlayFabMultiplayer.so"
+          unzip -p "$APK" assets/native_patches/armeabi-v7a/libPlayFabMultiplayer.so > "$PLAYFAB"
+          test -s "$PLAYFAB"
+          readelf -h "$PLAYFAB" | grep -Eq 'Class:.*ELF32'
+          readelf -h "$PLAYFAB" | grep -Eq 'Machine:.*ARM'
+          readelf -d "$PLAYFAB" | grep -Fq 'JMPREL'
+          readelf -d "$PLAYFAB" | grep -Fq 'PLTRELSZ'
+          readelf -rW "$PLAYFAB" | grep -Fq 'JUMP_SLOT'
+          readelf -rW "$PLAYFAB" | grep -Fq 'getauxval'
+          echo "Verified: packaged PlayFab replacement is ELF32 ARM and has a getauxval PLT relocation."
+          echo "Verified: GameActivity.initializeNativeCode is a defined global function in the packaged ARMv7 ELF."
+          """
+          '''
+          script = script.replace(verify_anchor, verify_patch, 1)
+
+          # Ensure that this candidate has unique output names, while carrying forward
+          # the V15 PairIP and native-loader fixes unchanged.
+          script = script.replace("v15-single-pairip", "v22-playfab-plt-fix")
+          script = script.replace("v15 single-PairIP", "v22 GameActivity JNI entrypoint")
+          script = script.replace(
+              "Build and static verification succeeded; launcher PairIP duplicate removed. Device launch remains unverified.",
+              "Build and static verification succeeded; GameActivity JNI export verified. Device launch remains unverified.",
+          )
+
+          child_env = os.environ.copy()
+          for key, value in (recipe.get("env") or {}).items():
+              child_env[str(key)] = str(value)
+          result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=workspace, env=child_env)
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          PY
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v22-playfab-plt-fix
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload V22 ARMv7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v22-playfab-plt-fix
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v22-playfab-plt-fix.apk
+          if-no-files-found: error
+          retention-days: 7
