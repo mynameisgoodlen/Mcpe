@@ -1,0 +1,216 @@
+name: Build LeviLauncher ARMv7 V16 GameActivity JNI fix APK (Android 10)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Mcpe workflow repository
+        uses: actions/checkout@v4
+
+      - name: Check out pinned LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: 38764ca77b4fcb9c27ab3cec688e67e5166141df
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Apply V16 JNI registration fix and execute the existing verified V15 build recipe
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          v15_path = workspace / ".github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v15-shared-namespace-fix.yml"
+          if not v15_path.is_file():
+              raise SystemExit(
+                  "Required existing V15 workflow was not found. Add this V16 file beside "
+                  "LeviLauncher-ARMv7-PairIP-workflow-v15-shared-namespace-fix.yml in the Mcpe repository."
+              )
+
+          v15 = yaml.safe_load(v15_path.read_text(encoding="utf-8"))
+          jobs = v15.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected one job in the V15 recipe, got {len(jobs)}")
+          v15_steps = next(iter(jobs.values())).get("steps", [])
+          recipe = next(
+              (step for step in v15_steps if step.get("id") == "build" and "run" in step),
+              None,
+          )
+          if recipe is None:
+              raise SystemExit("Could not find the build runner step in V15; refusing to guess")
+
+          script = recipe["run"]
+
+          # Carry forward the existing V15 ARMv7/PairIP build logic, but patch its
+          # source-mutation function so the strong JNI_OnLoad in libpreloader.so
+          # explicitly registers AndroidX GameActivity's native methods.
+          patch_anchor = '    print("Pre-build checks passed: native loader patch applied; Activity failure now preserves the original exception; debug R8 is disabled; targetSdk is 24 for Android 10 compatibility testing.")\n'
+          if script.count(patch_anchor) != 1:
+              raise SystemExit("Could not uniquely locate V15 pre-build validation block")
+
+          game_activity_patch = r'''
+              # V16: link the AndroidX GameActivity 4.4.2 static bridge into the
+              # exact library declared by android.app.lib_name (libpreloader.so).
+              # PreLoader.cpp already defines a strong JNI_OnLoad; AndroidX's
+              # weak JNI_OnLoad cannot replace it, so explicitly call
+              # GameActivity_register() from the preloader's existing JNI_OnLoad.
+              cmake_text = cmake.read_text(encoding="utf-8")
+              if "game-activity::game-activity_static" not in cmake_text:
+                  link_anchor = "add_subdirectory(preloader)"
+                  if cmake_text.count(link_anchor) != 1:
+                      raise SystemExit("Could not uniquely locate add_subdirectory(preloader) for GameActivity link")
+                  cmake_replacement = "\n".join([
+                      "find_package(game-activity REQUIRED CONFIG)",
+                      "add_subdirectory(preloader)",
+                      "target_link_libraries(preloader PRIVATE game-activity::game-activity_static)",
+                  ])
+                  cmake_text = cmake_text.replace(link_anchor, cmake_replacement, 1)
+                  cmake.write_text(cmake_text, encoding="utf-8")
+              if cmake_text.count("game-activity::game-activity_static") != 1:
+                  raise SystemExit("GameActivity static library link is missing or duplicated")
+
+              preloader_cpp = workspace / "source/app/src/main/cpp/preloader/src/pl/PreLoader.cpp"
+              if not preloader_cpp.is_file():
+                  raise SystemExit(f"Native preloader source is missing: {preloader_cpp}")
+              preloader_text = preloader_cpp.read_text(encoding="utf-8")
+              declaration = 'extern "C" int GameActivity_register(JNIEnv *env);\n'
+              if declaration not in preloader_text:
+                  include_anchor = '#include "pl/runtime/ModMenuBridge.h"\n'
+                  if preloader_text.count(include_anchor) != 1:
+                      raise SystemExit("Could not safely add GameActivity_register declaration")
+                  preloader_text = preloader_text.replace(include_anchor, include_anchor + "\n" + declaration, 1)
+
+              old_onload = "\n".join([
+                  "JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {",
+                  "  (void)reserved;",
+                  "  pl::runtime::SetJavaVm(vm);",
+                  "  return JNI_VERSION_1_4;",
+                  "}",
+              ])
+              new_onload = "\n".join([
+                  "JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {",
+                  "  (void)reserved;",
+                  "  JNIEnv *env = nullptr;",
+                  "  if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || env == nullptr) {",
+                  "    return JNI_ERR;",
+                  "  }",
+                  "  pl::runtime::SetJavaVm(vm);",
+                  "  if (GameActivity_register(env) != JNI_OK) {",
+                  "    return JNI_ERR;",
+                  "  }",
+                  "  return JNI_VERSION_1_6;",
+                  "}",
+              ])
+              if old_onload in preloader_text:
+                  preloader_text = preloader_text.replace(old_onload, new_onload, 1)
+              elif "GameActivity_register(env)" not in preloader_text:
+                  raise SystemExit("PreLoader.cpp JNI_OnLoad has an unexpected implementation; refusing to guess")
+              if "GameActivity_register(env)" not in preloader_text or "JNI_VERSION_1_6" not in preloader_text:
+                  raise SystemExit("V16 GameActivity native-registration call was not applied")
+              preloader_cpp.write_text(preloader_text, encoding="utf-8")
+              print("V16 applied: GameActivity static bridge linked; existing preloader JNI_OnLoad now calls GameActivity_register(env).")
+
+          '''
+          script = script.replace(patch_anchor, game_activity_patch + patch_anchor, 1)
+
+          # Verify the native GameActivity signature descriptor is present in the packaged
+          # preloader library. This is more appropriate than requiring a Java_* exported
+          # symbol because this bridge registers its native methods with RegisterNatives.
+          verify_anchor = '        script = script.replace(abi_marker, target_sdk_checks, 1)\n'
+          if script.count(verify_anchor) != 1:
+              raise SystemExit("Could not uniquely locate the V15 APK verification insertion point")
+          verify_patch = r'''
+                  script = script.replace(abi_marker, target_sdk_checks, 1)
+                  script += r"""
+          set -euo pipefail
+          APK="LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v16-gameactivity-jni.apk"
+          NATIVE="$RUNNER_TEMP/v16-libpreloader.so"
+          unzip -p "$APK" lib/armeabi-v7a/libpreloader.so > "$NATIVE"
+          test -s "$NATIVE"
+          if ! strings "$NATIVE" | grep -Fq 'initializeNativeCode'; then
+              echo "::error::Packaged libpreloader.so does not contain the GameActivity registration method name."
+              exit 1
+          fi
+          if ! strings "$NATIVE" | grep -Fq 'Landroid/content/res/Configuration;)J'; then
+              echo "::error::Packaged libpreloader.so is missing the Configuration-aware GameActivity JNI descriptor."
+              exit 1
+          fi
+          echo "Verified: ARMv7 libpreloader.so contains the GameActivity initializeNativeCode registration descriptor."
+          """
+          '''
+          script = script.replace(verify_anchor, verify_patch, 1)
+
+          # Give this candidate its own output names; preserve all V15 source and PairIP checks.
+          script = script.replace("v15-single-pairip", "v16-gameactivity-jni")
+          script = script.replace("v15 single-PairIP", "v16 GameActivity JNI")
+          script = script.replace(
+              "Build and static verification succeeded; launcher PairIP duplicate removed. Device launch remains unverified.",
+              "Build and static verification succeeded; GameActivity JNI registration descriptor verified. Device launch remains unverified.",
+          )
+
+          child_env = os.environ.copy()
+          for key, value in (recipe.get("env") or {}).items():
+              child_env[str(key)] = str(value)
+          result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=workspace, env=child_env)
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          PY
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v16-gameactivity-jni
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload V16 ARMv7 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v16-gameactivity-jni
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v16-gameactivity-jni.apk
+          if-no-files-found: error
+          retention-days: 7
