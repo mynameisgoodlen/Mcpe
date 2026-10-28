@@ -1,0 +1,1596 @@
+name: Build LeviLauncher ARMv7 game-class-loader bridge + PairIP diagnostics APK v27 (Android 10)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out this builder workflow
+        uses: actions/checkout@v4
+
+      - name: Check out LeviLaunchroid source and native submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: 38764ca77b4fcb9c27ab3cec688e67e5166141df
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: source/**/*.gradle*
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Fetch pinned recipe and build v27 official-Minecraft-namespace candidate
+        id: build
+        shell: bash
+        env:
+          TEMPLATE_COMMIT: a4ac407be409c912c7450335d9852885d831dfd4
+        run: |
+          set -euo pipefail
+          TEMPLATE="$RUNNER_TEMP/LeviLauncher-ARMv7-PairIP-workflow-v5-template.yml"
+          URL="https://raw.githubusercontent.com/mynameisgoodlen/Mcpe/${TEMPLATE_COMMIT}/.github/workflows/LeviLauncher-ARMv7-PairIP-workflow-v5.yml"
+          curl --fail --silent --show-error --location "$URL" --retry 3 --retry-delay 2 -o "$TEMPLATE"
+          test -s "$TEMPLATE"
+          echo "Pinned recipe downloaded: $(wc -c < "$TEMPLATE") bytes"
+          python3 - "$TEMPLATE" <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "PyYAML"],
+                  check=True,
+              )
+              import yaml
+
+          template_path = Path(sys.argv[1])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+          jobs = document.get("jobs", {})
+          if len(jobs) != 1:
+              raise SystemExit(f"Expected one job in pinned recipe; got {len(jobs)}")
+          steps = next(iter(jobs.values())).get("steps", [])
+          if not steps:
+              raise SystemExit("Pinned build recipe has no steps")
+
+          old_pairip_line = "i + '} else if (normalizedName == \"pairipcore\" || normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',"
+          new_pairip_lines = "\n".join([
+              "i + '} else if (normalizedName == \"pairipcore\") {',",
+              "                  i + '    initializeOfficialPairIp()',",
+              "                  i + '} else if (normalizedName == \"PlayFabMultiplayer\" || normalizedName == \"maesdk\") {',",
+          ])
+          old_dex_check = (
+              "loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "    raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+          new_dex_check = (
+              "    loader_dex = z.read('assets/runtime-native-loader.dex')\n"
+              "    if not loader_dex.startswith(b'dex\\n') or len(loader_dex) < 100:\n"
+              "        raise SystemExit('Standalone native-loader DEX asset is missing or invalid.')"
+          )
+
+          recipe_run_steps = []
+          pairip_fix_count = 0
+          dex_fix_count = 0
+          for step in steps:
+              if "run" not in step:
+                  continue
+              script = step["run"]
+              if old_pairip_line in script:
+                  if script.count(old_pairip_line) != 1:
+                      raise SystemExit("PairIP branch patch was ambiguous; refusing to build")
+                  script = script.replace(old_pairip_line, new_pairip_lines, 1)
+                  pairip_fix_count += 1
+              if old_dex_check in script:
+                  if script.count(old_dex_check) != 1:
+                      raise SystemExit("ZIP verifier patch was ambiguous; refusing to build")
+                  script = script.replace(old_dex_check, new_dex_check, 1)
+                  dex_fix_count += 1
+
+              script = script.replace(
+                  "LeviLauncher-ARMv7-build-log-v5", "LeviLauncher-ARMv7-build-log-v27"
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v5.apk",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v27.apk",
+              )
+              script = script.replace(
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v5",
+                  "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v27",
+              )
+              recipe_run_steps.append((step, script))
+
+          if pairip_fix_count != 1:
+              raise SystemExit(f"Expected exactly one PairIP loader patch; found {pairip_fix_count}")
+          if dex_fix_count != 1:
+              raise SystemExit(f"Expected exactly one ZIP verifier patch; found {dex_fix_count}")
+
+          required_recipe_markers = (
+              "PAIRIP_B64_00",
+              "Bundle compressed ARMv7 PairIP dependency",
+              "Extract and preload PlayFab and Mae dependencies before Minecraft",
+              "Load the Minecraft native dependency chain with a shared game-parent classloader",
+              "Compile standalone DEX entrypoint for the game-parent native loader",
+              "Verify the APK targets ARMv7",
+          )
+          original_text = template_path.read_text(encoding="utf-8")
+          missing = [marker for marker in required_recipe_markers if marker not in original_text]
+          if missing:
+              raise SystemExit("Pinned recipe is missing required sections: " + ", ".join(missing))
+
+          any_failed = False
+          build_failed = False
+          run_count = 0
+
+          def condition_allows(step):
+              condition = str(step.get("if", "")).strip()
+              if "always()" in condition:
+                  return True
+              if "failure()" in condition or "steps.build.outcome == 'failure'" in condition:
+                  return any_failed or build_failed
+              if "success()" in condition:
+                  return not any_failed
+              return not any_failed
+
+          GAME_CLASS_LOADER_BRIDGE_KT = r'''package org.levimc.launcher.core.minecraft
+
+          import android.app.Activity
+          import android.content.Context
+          import android.util.Log
+          import dalvik.system.BaseDexClassLoader
+          import dalvik.system.PathClassLoader
+          import java.io.File
+          import java.util.Collections
+
+          object GameClassLoaderBridge {
+              private const val TAG = "GameClassLoaderBridge"
+              internal const val ACTIVITY_CLASS = "org.levimc.launcher.core.minecraft.MinecraftActivity"
+              private const val GMS_NATIVE_LISTENER = "com.google.android.gms.tasks.NativeOnCompleteListener"
+
+              private val GAME_PACKAGES = arrayOf(
+                  "com.mojang.minecraftpe.",
+                  "com.google.androidgamesdk.",
+                  "com.microsoft.applications.events.",
+                  "com.microsoft.playfab.",
+                  "com.microsoft.xal.",
+                  "com.microsoft.xbox.",
+                  "com.microsoft.xboxtcui.",
+                  "com.xbox.httpclient.",
+                  "org.fmod."
+              )
+
+              @Volatile
+              private var gameLoader: ClassLoader? = null
+
+              private val reportedNames: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
+
+              private fun trace(line: String) {
+                  try {
+                      Log.w(TAG, line)
+                      GameDiagnostics.line("[bridge] " + line)
+                  } catch (ignored: Throwable) {
+                  }
+              }
+
+              private fun callerStack(): String {
+                  return try {
+                      val text = Log.getStackTraceString(Throwable("class load requested here"))
+                      if (text.length > 3500) text.substring(0, 3500) else text
+                  } catch (ignored: Throwable) {
+                      "(stack unavailable)"
+                  }
+              }
+
+              internal fun noteRequest(name: String, launcherHasIt: Boolean) {
+                  try {
+                      if (launcherHasIt) return
+                      if (!reportedNames.add(name)) return
+                      val pairip = name.startsWith("com.pairip.") || name.contains("licens", ignoreCase = true)
+                      if (pairip) {
+                          trace("MINECRAFT-OWN class (PairIP/license related): $name\n" + callerStack())
+                      } else {
+                          trace("MINECRAFT-OWN class: $name")
+                      }
+                  } catch (ignored: Throwable) {
+                  }
+              }
+
+              private fun reportPreloadedGameClasses(loader: ClassLoader) {
+                  try {
+                      val find = ClassLoader::class.java.getDeclaredMethod("findLoadedClass", String::class.java)
+                          .apply { isAccessible = true }
+                      val names = arrayOf(
+                          "com.mojang.minecraftpe.MainActivity",
+                          "com.google.androidgamesdk.GameActivity",
+                          "androidx.fragment.app.FragmentActivity",
+                          "androidx.activity.ComponentActivity",
+                          ACTIVITY_CLASS
+                      )
+                      val already = ArrayList<String>()
+                      for (name in names) {
+                          if (find.invoke(loader, name) != null) already.add(name)
+                      }
+                      trace(
+                          "Classes already defined by the Minecraft loader before the bridge: " +
+                              (if (already.isEmpty()) "none" else already.joinToString(", "))
+                      )
+                  } catch (t: Throwable) {
+                      trace("findLoadedClass probe failed: $t")
+                  }
+              }
+
+              private fun ensureLauncherCopy(minecraftLoader: ClassLoader, launcherLoader: ClassLoader, name: String) {
+                  var detail = "unchecked"
+                  var mismatch = false
+                  try {
+                      val mine = Class.forName(name, false, minecraftLoader)
+                      val launchers = Class.forName(name, false, launcherLoader)
+                      val mineMethods = mine.declaredMethods.size
+                      val launcherMethods = launchers.declaredMethods.size
+                      val mineFields = mine.declaredFields.size
+                      val launcherFields = launchers.declaredFields.size
+                      detail = "methods $mineMethods/$launcherMethods fields $mineFields/$launcherFields"
+                      mismatch = mineMethods != launcherMethods || mineFields != launcherFields
+                  } catch (t: Throwable) {
+                      trace("Could not compare $name copies: $t")
+                      return
+                  }
+                  trace("Copy check for $name: $detail" + (if (mismatch) "  <-- MINECRAFT'S OWN COPY" else "  (launcher copy)"))
+                  try {
+                      trace("  minecraft-loader copy: " + GameDiagnostics.describeClass(Class.forName(name, false, minecraftLoader)))
+                      trace("  launcher-loader copy : " + GameDiagnostics.describeClass(Class.forName(name, false, launcherLoader)))
+                  } catch (ignored: Throwable) {
+                  }
+                  if (mismatch) {
+                      throw IllegalStateException(
+                          "Minecraft loader defined Minecraft's own $name instead of the launcher copy ($detail); " +
+                              "it was loaded before the bridge was installed"
+                      )
+                  }
+              }
+
+              private fun describePairIp(minecraftLoader: ClassLoader, minecraftElements: Array<*>) {
+                  try {
+                      val names = ArrayList<String>()
+                      for (element in minecraftElements) {
+                          if (element == null) continue
+                          try {
+                              val dexFileField = element.javaClass.getDeclaredField("dexFile").apply { isAccessible = true }
+                              val dexFile = dexFileField.get(element) as? dalvik.system.DexFile ?: continue
+                              val entries = dexFile.entries()
+                              while (entries.hasMoreElements()) {
+                                  val name = entries.nextElement()
+                                  if (name.startsWith("com.pairip.")) names.add(name)
+                              }
+                          } catch (ignored: Throwable) {
+                          }
+                      }
+                      names.sort()
+                      trace("Minecraft dex contains ${names.size} com.pairip.* class(es):\n" + names.joinToString("\n"))
+                  } catch (t: Throwable) {
+                      trace("Could not enumerate com.pairip.* classes: $t")
+                  }
+                  try {
+                      val runner = Class.forName("com.pairip.VMRunner", false, minecraftLoader)
+                      val sb = StringBuilder("com.pairip.VMRunner members (loader=" + runner.classLoader + "):\n")
+                      for (f in runner.declaredFields) sb.append("  field ").append(f.type.name).append(' ').append(f.name).append(" mods=").append(f.modifiers).append('\n')
+                      for (m in runner.declaredMethods) {
+                          sb.append("  method ").append(m.returnType.name).append(' ').append(m.name).append('(')
+                          sb.append(m.parameterTypes.joinToString(",") { it.name }).append(") mods=").append(m.modifiers).append('\n')
+                      }
+                      trace(sb.toString())
+                  } catch (t: Throwable) {
+                      trace("Could not describe com.pairip.VMRunner: $t")
+                  }
+              }
+
+              @JvmStatic
+              fun isGameClass(name: String): Boolean {
+                  if (name == ACTIVITY_CLASS || name == GMS_NATIVE_LISTENER) return true
+                  if (name.startsWith("$ACTIVITY_CLASS\$")) return true
+                  for (prefix in GAME_PACKAGES) {
+                      if (name.startsWith(prefix)) return true
+                  }
+                  return false
+              }
+
+              private const val MINECRAFT_PACKAGE = "com.mojang.minecraftpe"
+
+              @Synchronized
+              @JvmStatic
+              fun obtainGameLoader(context: Context): ClassLoader {
+                  val existing = gameLoader
+                  if (existing != null) return existing
+                  val launcherLoader = GameClassLoaderBridge::class.java.classLoader
+                      ?: throw UnsatisfiedLinkError("Launcher ClassLoader is unavailable")
+                  GameDiagnostics.ensureStarted(context)
+                  GameDiagnostics.event(
+                      "bridge-install-begin",
+                      "creating the dedicated game loader; launcherLoader=" + GameDiagnostics.loaderId(launcherLoader) +
+                          " thread=" + Thread.currentThread().name
+                  )
+                  try {
+                      val minecraft = context.packageManager.getApplicationInfo(MINECRAFT_PACKAGE, 0)
+                      val launcherApk = context.applicationInfo.sourceDir
+                      val codePaths = ArrayList<String>()
+                      codePaths.add(launcherApk)
+                      codePaths.addAll(minecraftCodeApks(minecraft))
+                      val libraryDirs = ArrayList<String>()
+                      if (minecraft.nativeLibraryDir != null) libraryDirs.add(minecraft.nativeLibraryDir)
+                      collectLibraryDirs(File(context.filesDir, "minecraft_libs"), 0, libraryDirs)
+                      trace("game loader code paths: $codePaths")
+                      trace("game loader native library dirs: $libraryDirs")
+
+                      val loader: ClassLoader = PathClassLoader(
+                          codePaths.joinToString(File.pathSeparator),
+                          libraryDirs.joinToString(File.pathSeparator),
+                          LauncherDelegatingParent(launcherLoader)
+                      )
+                      detachLauncherResources(loader, launcherApk)
+                      reportPreloadedGameClasses(loader)
+                      GameDiagnostics.section(
+                          "GAME LOADER CREATED",
+                          GameDiagnostics.loaderReport("launcher (app) loader", launcherLoader) +
+                              GameDiagnostics.loaderReport("dedicated game loader", loader)
+                      )
+                      describePairIp(loader, dexElementsOf(loader))
+
+                      val activityClass = loader.loadClass(ACTIVITY_CLASS)
+                      val gameActivityClass = loader.loadClass("com.google.androidgamesdk.GameActivity")
+                      check(activityClass.classLoader === loader) { "MinecraftActivity is not defined by the game loader" }
+                      check(gameActivityClass.classLoader === loader) { "GameActivity is not defined by the game loader" }
+                      check(gameActivityClass.isAssignableFrom(activityClass)) {
+                          "MinecraftActivity does not extend the game-loader GameActivity"
+                      }
+                      ensureLauncherCopy(loader, launcherLoader, "com.mojang.minecraftpe.MainActivity")
+                      ensureLauncherCopy(loader, launcherLoader, "com.google.androidgamesdk.GameActivity")
+
+                      gameLoader = loader
+                      hookActivityCreation(context, loader)
+                      GameDiagnostics.event("bridge-installed", "game classes and game libraries use " + GameDiagnostics.loaderId(loader))
+                      return loader
+                  } catch (t: Throwable) {
+                      Log.e(TAG, "Failed to create the game class loader", t)
+                      throw UnsatisfiedLinkError(
+                          "Game class-loader bridge failed: ${t.message ?: t.javaClass.simpleName}"
+                      ).also { it.initCause(t) }
+                  }
+              }
+
+              @JvmStatic
+              fun initializePairIp(context: Context) {
+                  val loader = obtainGameLoader(context)
+                  GameDiagnostics.event("pairip", "initialising com.pairip.VMRunner in the game loader")
+                  try {
+                      Class.forName("com.pairip.VMRunner", true, loader)
+                      GameDiagnostics.event("pairip", "com.pairip.VMRunner initialised")
+                  } catch (t: Throwable) {
+                      trace("PairIP initialisation failed: " + Log.getStackTraceString(t))
+                      throw UnsatisfiedLinkError(
+                          "Cannot initialize official PairIP using the game class loader: ${t.message ?: t.javaClass.simpleName}"
+                      ).also { it.initCause(t) }
+                  }
+              }
+
+              private fun minecraftCodeApks(info: android.content.pm.ApplicationInfo): List<String> {
+                  val all = ArrayList<String>()
+                  all.add(info.sourceDir)
+                  val splits = info.splitSourceDirs
+                  if (splits != null) {
+                      for (split in splits) all.add(split)
+                  }
+                  val withCode = ArrayList<String>()
+                  for (apk in all) {
+                      try {
+                          java.util.zip.ZipFile(apk).use { zip ->
+                              if (zip.getEntry("classes.dex") != null) withCode.add(apk)
+                          }
+                      } catch (ignored: Throwable) {
+                      }
+                  }
+                  if (withCode.isEmpty()) withCode.add(info.sourceDir)
+                  return withCode
+              }
+
+              private fun collectLibraryDirs(dir: File, depth: Int, into: MutableList<String>) {
+                  if (depth > 6 || !dir.isDirectory) return
+                  val children = dir.listFiles() ?: return
+                  var hasLibrary = false
+                  for (child in children) {
+                      if (child.isFile && child.name.endsWith(".so")) hasLibrary = true
+                  }
+                  if (hasLibrary) into.add(dir.absolutePath)
+                  for (child in children) {
+                      if (child.isDirectory) collectLibraryDirs(child, depth + 1, into)
+                  }
+              }
+
+              private fun dexElementsOf(loader: ClassLoader): Array<*> {
+                  val baseDexLoader = Class.forName("dalvik.system.BaseDexClassLoader")
+                  val pathListField = baseDexLoader.getDeclaredField("pathList").apply { isAccessible = true }
+                  val pathList = pathListField.get(loader) ?: throw IllegalStateException("Loader has no pathList")
+                  val elementsField = pathList.javaClass.getDeclaredField("dexElements").apply { isAccessible = true }
+                  return elementsField.get(pathList) as Array<*>
+              }
+
+              private fun detachLauncherResources(loader: ClassLoader, launcherApk: String) {
+                  try {
+                      var detached = 0
+                      for (element in dexElementsOf(loader)) {
+                          if (element == null) continue
+                          val pathField = element.javaClass.getDeclaredField("path").apply { isAccessible = true }
+                          if (pathField.get(element)?.toString() == launcherApk) {
+                              pathField.set(element, null)
+                              detached++
+                          }
+                      }
+                      trace("Detached resource lookup from $detached launcher dex element(s)")
+                  } catch (t: Throwable) {
+                      trace("WARNING: could not detach launcher resources: $t")
+                  }
+              }
+
+              @Volatile
+              private var factoryRequests = 0
+
+              @Volatile
+              private var factoryResult = "factory never asked for MinecraftActivity"
+
+              @Volatile
+              private var factoryHook = "not attempted"
+
+              @Volatile
+              private var routerHook = "not attempted"
+
+              @Volatile
+              private var routerRequests = 0
+
+              @Volatile
+              private var factoryAllCalls = 0
+
+              @Volatile
+              private var factoryLastNames = ""
+
+              @Volatile
+              private var factoryLastLoader = "none"
+
+              @JvmStatic
+              fun noteFactoryCall(className: String, loader: ClassLoader?) {
+                  factoryAllCalls++
+                  factoryLastNames = (factoryLastNames + " " + className.substringAfterLast('.')).takeLast(160)
+                  factoryLastLoader = loaderLabel(loader, GameClassLoaderBridge::class.java.classLoader)
+              }
+
+              private fun hookActivityCreation(context: Context, game: ClassLoader) {
+                  var loadedApk: Any? = null
+                  try {
+                      val activityThreadClass = Class.forName("android.app.ActivityThread")
+                      val thread = activityThreadClass.getMethod("currentActivityThread").invoke(null)
+                          ?: throw IllegalStateException("No ActivityThread")
+                      loadedApk = activityThreadClass
+                          .getMethod("peekPackageInfo", String::class.java, Boolean::class.javaPrimitiveType)
+                          .invoke(thread, context.packageName, true)
+                          ?: throw IllegalStateException("No LoadedApk for " + context.packageName)
+                      val field = loadedApk.javaClass.getDeclaredField("mAppComponentFactory").apply { isAccessible = true }
+                      val existing = field.get(loadedApk)
+                      if (existing is GameComponentFactory) {
+                          factoryHook = "already GameComponentFactory"
+                      } else {
+                          field.set(loadedApk, GameComponentFactory())
+                          factoryHook = "hooked (previous factory: " + (existing?.javaClass?.name ?: "null") + ")"
+                      }
+                  } catch (t: Throwable) {
+                      factoryHook = "FAILED: $t"
+                  }
+                  trace("AppComponentFactory: $factoryHook")
+
+                  try {
+                      val apk = loadedApk ?: throw IllegalStateException("No LoadedApk")
+                      val classLoaderField = apk.javaClass.getDeclaredField("mClassLoader").apply { isAccessible = true }
+                      val current = classLoaderField.get(apk) as? ClassLoader ?: throw IllegalStateException("LoadedApk has no ClassLoader")
+                      val base = if (current is ActivityRoutingLoader) (current.parent ?: current) else current
+                      classLoaderField.set(apk, ActivityRoutingLoader(base, game))
+                      routerHook = "installed (base loader: " + base.javaClass.simpleName + ")"
+                  } catch (t: Throwable) {
+                      routerHook = "FAILED: $t"
+                  }
+                  trace("Activity class-loader router: $routerHook")
+              }
+
+              private fun loaderLabel(loader: ClassLoader?, launcher: ClassLoader?): String {
+                  return when {
+                      loader == null -> "boot"
+                      loader === gameLoader -> "MINECRAFT-LOADER"
+                      loader === launcher -> "LAUNCHER-LOADER"
+                      else -> loader.javaClass.simpleName + "@" + Integer.toHexString(System.identityHashCode(loader))
+                  }
+              }
+
+              @JvmStatic
+              fun describeActivity(activity: Any): String {
+                  return try {
+                      val launcher = GameClassLoaderBridge::class.java.classLoader
+                      val sb = StringBuilder()
+                      sb.append("diagnosticsFile=").append(GameDiagnostics.path()).append(" bridgeInstalled=").append(gameLoader != null)
+                      sb.append(" factoryHook=").append(factoryHook)
+                      sb.append(" routerHook=").append(routerHook)
+                      sb.append(" routerRequests=").append(routerRequests)
+                      sb.append(" factoryAllCalls=").append(factoryAllCalls)
+                      sb.append(" factoryLast=[").append(factoryLastNames.trim()).append("] factoryLoader=").append(factoryLastLoader)
+                      sb.append(" factoryRequests=").append(factoryRequests)
+                      sb.append(" factoryResult=").append(factoryResult)
+                      sb.append(" activityChain=")
+                      var current: Class<*>? = activity.javaClass
+                      var depth = 0
+                      while (current != null && depth < 6) {
+                          sb.append(current.simpleName).append(':').append(loaderLabel(current.classLoader, launcher)).append(' ')
+                          current = current.superclass
+                          depth++
+                      }
+                      val installed = gameLoader
+                      if (installed != null) {
+                          try {
+                              val ga = Class.forName("com.google.androidgamesdk.GameActivity", false, installed)
+                              sb.append("minecraftLoaderGameActivity=").append(loaderLabel(ga.classLoader, launcher))
+                          } catch (t: Throwable) {
+                              sb.append("minecraftLoaderGameActivity=ERR:").append(t.javaClass.simpleName)
+                          }
+                      }
+                      sb.toString()
+                  } catch (t: Throwable) {
+                      "describe failed: $t"
+                  }
+              }
+
+              @JvmStatic
+              fun reportActivityFailure(activity: Any, error: Throwable) {
+                  trace("MinecraftActivity failure [" + describeActivity(activity) + "]")
+                  try {
+                      GameDiagnostics.failure(
+                          "MinecraftActivity.onCreate failed (Mojang MainActivity.onCreate threw)",
+                          error,
+                          describeActivity(activity) + "\n--- who defines each class in the activity chain ---\n" +
+                              GameDiagnostics.classChain(activity.javaClass)
+                      )
+                  } catch (ignored: Throwable) {
+                  }
+              }
+
+              private fun installFromApplication() {
+                  val application = Class.forName("android.app.ActivityThread")
+                      .getMethod("currentApplication").invoke(null) as? Context
+                      ?: throw IllegalStateException("No current application")
+                  obtainGameLoader(application)
+              }
+
+              @JvmStatic
+              fun newGameActivity(className: String): Activity? {
+                  if (className != ACTIVITY_CLASS) return null
+                  factoryRequests++
+                  if (gameLoader == null) {
+                      trace("GameComponentFactory: bridge not installed yet, installing from the application context")
+                      try {
+                          installFromApplication()
+                      } catch (t: Throwable) {
+                          trace("On-demand bridge install failed: " + Log.getStackTraceString(t))
+                      }
+                  }
+                  val loader = gameLoader
+                  if (loader == null) {
+                      factoryResult = "bridge unavailable, default launcher-loader activity used"
+                      trace("GameComponentFactory: $factoryResult")
+                      return null
+                  }
+                  trace("GameComponentFactory: creating MinecraftActivity through the Minecraft ClassLoader")
+                  return try {
+                      val created = loader.loadClass(className).getDeclaredConstructor().newInstance() as Activity
+                      factoryResult = "created through the Minecraft loader"
+                      created
+                  } catch (t: Throwable) {
+                      factoryResult = "failed: $t"
+                      trace("Could not instantiate $className through the Minecraft ClassLoader: " + Log.getStackTraceString(t))
+                      null
+                  }
+              }
+
+              /**
+               * Extends PathClassLoader (a BaseDexClassLoader subclass) so GameActivity.onCreate's
+               * cast `(BaseDexClassLoader) getClassLoader()` succeeds, and delegates findLibrary()
+               * to the game loader so GameActivity.findLibrary("minecraftpe") resolves the game's
+               * extracted/installed libminecraftpe.so path.
+               */
+              private class ActivityRoutingLoader(
+                  parent: ClassLoader,
+                  private val game: ClassLoader
+              ) : PathClassLoader("", null, parent) {
+                  override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                      if (name == GameClassLoaderBridge.ACTIVITY_CLASS) {
+                          GameClassLoaderBridge.noteRouted()
+                          return game.loadClass(name)
+                      }
+                      return super.loadClass(name, resolve)
+                  }
+
+                  override fun findLibrary(name: String?): String? {
+                      if (name == null) return null
+                      if (game is BaseDexClassLoader) {
+                          val fromGame = game.findLibrary(name)
+                          if (fromGame != null) return fromGame
+                      }
+                      val p = parent
+                      if (p is BaseDexClassLoader) {
+                          val fromParent = p.findLibrary(name)
+                          if (fromParent != null) return fromParent
+                      }
+                      return super.findLibrary(name)
+                  }
+              }
+
+              internal fun noteRouted() {
+                  routerRequests++
+              }
+
+              private class LauncherDelegatingParent(
+                  private val launcherLoader: ClassLoader
+              ) : ClassLoader(null as ClassLoader?) {
+                  override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                      if (GameClassLoaderBridge.isGameClass(name)) {
+                          val launcherHasCopy = try {
+                              Class.forName(name, false, launcherLoader)
+                              true
+                          } catch (ignored: Throwable) {
+                              false
+                          }
+                          GameClassLoaderBridge.noteRequest(name, launcherHasCopy)
+                          throw ClassNotFoundException(name)
+                      }
+                      return try {
+                          launcherLoader.loadClass(name)
+                      } catch (e: ClassNotFoundException) {
+                          GameClassLoaderBridge.noteRequest(name, false)
+                          throw e
+                      }
+                  }
+              }
+          }
+          '''
+
+          GAME_COMPONENT_FACTORY_KT = r'''package org.levimc.launcher.core.minecraft
+
+          import android.app.Activity
+          import android.app.AppComponentFactory
+          import android.content.Intent
+
+          class GameComponentFactory : AppComponentFactory() {
+              override fun instantiateActivity(
+                  cl: ClassLoader,
+                  className: String,
+                  intent: Intent?
+              ): Activity {
+                  GameClassLoaderBridge.noteFactoryCall(className, cl)
+                  GameClassLoaderBridge.newGameActivity(className)?.let { return it }
+                  return super.instantiateActivity(cl, className, intent)
+              }
+          }
+          '''
+
+          GAME_DIAGNOSTICS_JAVA = r'''package org.levimc.launcher.core.minecraft;
+
+          import android.app.ActivityManager;
+          import android.content.Context;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.Signature;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.Process;
+          import android.os.SystemClock;
+          import android.util.Log;
+          import android.widget.Toast;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.FileReader;
+          import java.io.InputStreamReader;
+          import java.io.PrintWriter;
+          import java.io.RandomAccessFile;
+          import java.io.StringWriter;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.InvocationHandler;
+          import java.lang.reflect.InvocationTargetException;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.Proxy;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+          import java.security.MessageDigest;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.Enumeration;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.regex.Pattern;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+
+          public final class GameDiagnostics {
+              private static final String TAG = "GameDiagnostics";
+              public static final String VERSION = "v27";
+              private static final String FILE_NAME = "LeviLauncher-diagnostics.txt";
+
+              private static final long SESSION_SOFT_CAP = 7L * 1024 * 1024;
+              private static final long SESSION_HARD_CAP = 12L * 1024 * 1024;
+              private static final long LOGCAT_CAP = 3L * 1024 * 1024;
+              private static final long WATCH_CAP = 1536L * 1024;
+              private static final long FILE_TRIM_AT = 14L * 1024 * 1024;
+              private static final long FILE_KEEP = 8L * 1024 * 1024;
+
+              private static final Object LOCK = new Object();
+              private static final Object START_LOCK = new Object();
+              private static volatile boolean startAttempted = false;
+              private static volatile File logFile;
+              private static volatile FileOutputStream out;
+              private static volatile Context appContext;
+              private static volatile long startElapsed;
+              private static volatile int myPid;
+              private static volatile long watchUntil;
+              private static long sessionBytes;
+              private static long watchBytes;
+              private static String sessionId = "?";
+
+              private static final LinkedHashMap<String, String> STAGES = new LinkedHashMap<String, String>();
+              private static final Set<String> WATCH_SEEN = Collections.synchronizedSet(new HashSet<String>());
+              private static final Set<String> FIRED_TRIGGERS = Collections.synchronizedSet(new HashSet<String>());
+              private static final Map<String, Long> LIB_STARTED = Collections.synchronizedMap(new HashMap<String, Long>());
+
+              private static final Pattern LOGCAT_KEYWORDS = Pattern.compile(
+                      "(?i)MinecraftLaunch|GameClassLoader|GameDiagnostics|levimc|mojang|minecraft|pairip|VMRunner"
+                              + "|linker|dlopen|UnsatisfiedLink|JNI|FATAL|AndroidRuntime|ActivityManager|ActivityThread"
+                              + "|DEBUG|libc|abort|crash|PlayFab|maesdk|fmod|Instrumentation|ClassLoader|dex2oat|oat"
+                              + "|Choreographer|OpenGL|EGL|Vulkan|billing|license|integrity|signature");
+
+              private GameDiagnostics() {
+              }
+
+              public static boolean isStarted() {
+                  return out != null;
+              }
+
+              public static String path() {
+                  File f = logFile;
+                  return f == null ? "(diagnostics file not open)" : f.getAbsolutePath();
+              }
+
+              public static void ensureStarted(Context context) {
+                  if (startAttempted || context == null) return;
+                  synchronized (START_LOCK) {
+                      if (startAttempted) return;
+                      startAttempted = true;
+                  }
+                  try {
+                      Context app = context.getApplicationContext();
+                      start(app != null ? app : context);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "Diagnostics start failed", t);
+                  }
+              }
+
+              public static void line(String text) {
+                  write(stamp() + " [" + Thread.currentThread().getName() + "] " + text + "\n", false);
+              }
+
+              public static void event(String stage, String detail) {
+                  String value = stamp() + " " + detail;
+                  synchronized (STAGES) {
+                      STAGES.put(stage, value);
+                  }
+                  extendWatch(90000L);
+                  line("#K " + stage + ": " + detail);
+              }
+
+              public static void section(String title, String body) {
+                  write("\n===== " + title + " (" + stamp() + ") =====\n" + body + "\n===== end " + title + " =====\n", false);
+              }
+
+              public static void failure(String title, Throwable error, String extra) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("\n########## FAILURE: ").append(title).append(" (").append(stamp()).append(") ##########\n");
+                  if (extra != null && extra.length() > 0) sb.append(extra).append("\n");
+                  if (error != null) sb.append("--- exception ---\n").append(stackToString(error)).append("\n");
+                  sb.append("--- state snapshot ---\n").append(snapshotText("failure: " + title)).append("\n");
+                  sb.append("--- all Java threads ---\n").append(allThreadStacks(45)).append("\n");
+                  sb.append("########## end FAILURE ##########\n");
+                  write(sb.toString(), true);
+              }
+
+              public static void snapshot(String reason) {
+                  write("\n===== STATE SNAPSHOT: " + reason + " (" + stamp() + ") =====\n" + snapshotText(reason)
+                          + "\n===== end STATE SNAPSHOT =====\n", true);
+              }
+
+              public static String describeClass(Class<?> c) {
+                  if (c == null) return "null";
+                  return c.getName() + " | loader=" + loaderId(c.getClassLoader()) + " | dex=" + provenance(c);
+              }
+
+              public static String classChain(Class<?> c) {
+                  StringBuilder sb = new StringBuilder();
+                  int depth = 0;
+                  while (c != null && depth < 12) {
+                      sb.append("  ").append(describeClass(c)).append('\n');
+                      c = c.getSuperclass();
+                      depth++;
+                  }
+                  return sb.toString();
+              }
+
+              public static String loaderId(ClassLoader cl) {
+                  if (cl == null) return "boot";
+                  return cl.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(cl));
+              }
+
+              public static String provenance(Class<?> c) {
+                  try {
+                      Field dexCache = Class.class.getDeclaredField("dexCache");
+                      dexCache.setAccessible(true);
+                      Object cache = dexCache.get(c);
+                      if (cache == null) return "no-dexcache";
+                      Field location = cache.getClass().getDeclaredField("location");
+                      location.setAccessible(true);
+                      return String.valueOf(location.get(cache));
+                  } catch (Throwable t) {
+                      return "unknown(" + t.getClass().getSimpleName() + ")";
+                  }
+              }
+
+              public static String loaderReport(String label, ClassLoader loader) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("--- loader report: ").append(label).append(" ---\n");
+                  ClassLoader cl = loader;
+                  int depth = 0;
+                  while (cl != null && depth < 8) {
+                      sb.append("  [").append(depth).append("] ").append(loaderId(cl)).append('\n');
+                      appendDexLoaderDetails(sb, cl);
+                      cl = cl.getParent();
+                      depth++;
+                  }
+                  if (cl == null) sb.append("  [").append(depth).append("] boot\n");
+                  return sb.toString();
+              }
+
+              public static void libLoadBegin(File file) {
+                  try {
+                      LIB_STARTED.put(file.getName(), SystemClock.elapsedRealtime());
+                      event("lib", "loading " + file.getName() + " size=" + file.length() + " " + elfSummary(file));
+                  } catch (Throwable t) {
+                      line("libLoadBegin failed: " + t);
+                  }
+              }
+
+              public static void libLoadEnd(File file) {
+                  try {
+                      Long began = LIB_STARTED.get(file.getName());
+                      long ms = began == null ? -1 : SystemClock.elapsedRealtime() - began;
+                      event("lib", "loaded " + file.getName() + " in " + ms + "ms, mapped now: " + mappedCount(file.getName()));
+                      if ("libminecraftpe.so".equals(file.getName())) snapshot("libminecraftpe.so loaded");
+                  } catch (Throwable t) {
+                      line("libLoadEnd failed: " + t);
+                  }
+              }
+
+              private static void start(Context ctx) throws Exception {
+                  appContext = ctx;
+                  startElapsed = SystemClock.elapsedRealtime();
+                  myPid = Process.myPid();
+                  sessionId = Long.toHexString(System.currentTimeMillis()) + "-" + myPid;
+                  watchUntil = SystemClock.elapsedRealtime() + 30000L;
+                  openLogFile(ctx);
+                  write(banner(ctx), true);
+                  try {
+                      write(environmentReport(ctx), true);
+                  } catch (Throwable t) {
+                      write("environment report failed: " + stackToString(t) + "\n", true);
+                  }
+                  try {
+                      attachPreviousCrashes(ctx);
+                  } catch (Throwable t) {
+                      write("attaching previous crashes failed: " + stackToString(t) + "\n", true);
+                  }
+                  installCrashHooks();
+                  startLogcatTee();
+                  startThreadWatcher();
+                  showToast(ctx);
+                  event("diagnostics", "started, file=" + path());
+              }
+
+              private static void openLogFile(Context ctx) {
+                  List<File> candidates = new ArrayList<File>();
+                  try {
+                      File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                      if (downloads != null && (downloads.isDirectory() || downloads.mkdirs())) {
+                          candidates.add(new File(downloads, FILE_NAME));
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      File external = ctx.getExternalFilesDir(null);
+                      if (external != null) candidates.add(new File(external, FILE_NAME));
+                  } catch (Throwable ignored) {
+                  }
+                  candidates.add(new File(ctx.getFilesDir(), FILE_NAME));
+                  for (File candidate : candidates) {
+                      try {
+                          trimIfHuge(candidate);
+                          FileOutputStream stream = new FileOutputStream(candidate, true);
+                          logFile = candidate;
+                          out = stream;
+                          return;
+                      } catch (Throwable ignored) {
+                      }
+                  }
+              }
+
+              private static void trimIfHuge(File f) {
+                  try {
+                      if (!f.isFile() || f.length() <= FILE_TRIM_AT) return;
+                      RandomAccessFile raf = new RandomAccessFile(f, "r");
+                      byte[] tail = new byte[(int) FILE_KEEP];
+                      raf.seek(f.length() - FILE_KEEP);
+                      raf.readFully(tail);
+                      raf.close();
+                      FileOutputStream rewrite = new FileOutputStream(f, false);
+                      rewrite.write("[older diagnostics trimmed to keep the file small]\n".getBytes("UTF-8"));
+                      rewrite.write(tail);
+                      rewrite.close();
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private static String banner(Context ctx) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("\n\n");
+                  sb.append("################################################################################\n");
+                  sb.append("#### LEVILAUNCHER DIAGNOSTICS ").append(VERSION).append("  session=").append(sessionId).append('\n');
+                  sb.append("#### started ").append(new java.util.Date()).append("  pid=").append(myPid).append('\n');
+                  sb.append("#### file: ").append(path()).append('\n');
+                  sb.append("################################################################################\n");
+                  return sb.toString();
+              }
+
+              private static void showToast(final Context ctx) {
+                  try {
+                      new Handler(Looper.getMainLooper()).post(new Runnable() {
+                          @Override
+                          public void run() {
+                              try {
+                                  Toast.makeText(ctx, "Diagnostics file: " + path(), Toast.LENGTH_LONG).show();
+                              } catch (Throwable ignored) {
+                              }
+                          }
+                      });
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private static String stamp() {
+                  long ms = SystemClock.elapsedRealtime() - startElapsed;
+                  return String.format(Locale.US, "T+%8.3fs", ms / 1000.0);
+              }
+
+              private static void write(String text, boolean critical) {
+                  FileOutputStream stream = out;
+                  if (stream == null || text == null) return;
+                  synchronized (LOCK) {
+                      try {
+                          byte[] bytes = text.getBytes("UTF-8");
+                          long cap = critical ? SESSION_HARD_CAP : SESSION_SOFT_CAP;
+                          if (sessionBytes + bytes.length > cap) return;
+                          stream.write(bytes);
+                          sessionBytes += bytes.length;
+                      } catch (Throwable ignored) {
+                      }
+                  }
+              }
+
+              private static String environmentReport(Context ctx) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("===== ENVIRONMENT =====\n");
+                  sb.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.BRAND).append(' ').append(Build.MODEL)
+                          .append(" (").append(Build.DEVICE).append(")\n");
+                  sb.append("android: ").append(Build.VERSION.RELEASE).append(" sdk=").append(Build.VERSION.SDK_INT)
+                          .append(" incremental=").append(Build.VERSION.INCREMENTAL).append('\n');
+                  sb.append("fingerprint: ").append(Build.FINGERPRINT).append('\n');
+                  sb.append("supported ABIs: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
+                  sb.append("process is64Bit=").append(Process.is64Bit()).append(" pid=").append(myPid)
+                          .append(" uid=").append(Process.myUid()).append('\n');
+                  sb.append(memoryText(ctx));
+                  sb.append("===== end ENVIRONMENT =====\n");
+                  return sb.toString();
+              }
+
+              private static String memoryText(Context ctx) {
+                  StringBuilder sb = new StringBuilder();
+                  Runtime rt = Runtime.getRuntime();
+                  sb.append("java heap: max=").append(rt.maxMemory() / 1048576).append("MB total=")
+                          .append(rt.totalMemory() / 1048576).append("MB free=").append(rt.freeMemory() / 1048576).append("MB\n");
+                  try {
+                      ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+                      ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+                      am.getMemoryInfo(mi);
+                      sb.append("system memory: avail=").append(mi.availMem / 1048576).append("MB total=")
+                              .append(mi.totalMem / 1048576).append("MB lowMemory=").append(mi.lowMemory).append('\n');
+                  } catch (Throwable ignored) {
+                  }
+                  return sb.toString();
+              }
+
+              public static String elfSummary(File f) {
+                  RandomAccessFile raf = null;
+                  try {
+                      raf = new RandomAccessFile(f, "r");
+                      byte[] ident = new byte[16];
+                      raf.readFully(ident);
+                      if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') return "NOT-ELF";
+                      int cls = ident[4];
+                      ByteOrder order = ident[5] == 1 ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+                      if (cls != 1) return "ELF" + (cls == 2 ? "64" : "?") + " (not 32-bit)";
+                      byte[] hb = new byte[52];
+                      raf.seek(0);
+                      raf.readFully(hb);
+                      ByteBuffer h = ByteBuffer.wrap(hb).order(order);
+                      int machine = h.getShort(18) & 0xffff;
+                      return "ELF32 machine=" + (machine == 40 ? "ARM" : String.valueOf(machine));
+                  } catch (Throwable t) {
+                      return "elf-read-failed(" + t.getClass().getSimpleName() + ")";
+                  } finally {
+                      if (raf != null) {
+                          try {
+                              raf.close();
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                  }
+              }
+
+              private static void appendDexLoaderDetails(StringBuilder sb, ClassLoader cl) {
+                  try {
+                      Class<?> base = Class.forName("dalvik.system.BaseDexClassLoader");
+                      if (!base.isInstance(cl)) return;
+                      Field pathListField = base.getDeclaredField("pathList");
+                      pathListField.setAccessible(true);
+                      Object pathList = pathListField.get(cl);
+                      if (pathList == null) return;
+                      Field elementsField = pathList.getClass().getDeclaredField("dexElements");
+                      elementsField.setAccessible(true);
+                      Object[] elements = (Object[]) elementsField.get(pathList);
+                      sb.append("      dexElements=").append(elements == null ? 0 : elements.length).append('\n');
+                  } catch (Throwable t) {
+                      sb.append("      (could not read dex details: ").append(t.getClass().getSimpleName()).append(")\n");
+                  }
+              }
+
+              private static String snapshotText(String reason) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("reason: ").append(reason).append('\n');
+                  sb.append("key stages so far:\n");
+                  synchronized (STAGES) {
+                      for (Map.Entry<String, String> e : STAGES.entrySet()) {
+                          sb.append("  ").append(e.getKey()).append(" -> ").append(e.getValue()).append('\n');
+                      }
+                  }
+                  Context ctx = appContext;
+                  if (ctx != null) sb.append(memoryText(ctx));
+                  return sb.toString();
+              }
+
+              private static int mappedCount(String libName) {
+                  int count = 0;
+                  BufferedReader reader = null;
+                  try {
+                      reader = new BufferedReader(new FileReader("/proc/self/maps"));
+                      String l;
+                      while ((l = reader.readLine()) != null) {
+                          if (l.endsWith("/" + libName)) count++;
+                      }
+                  } catch (Throwable ignored) {
+                  } finally {
+                      if (reader != null) {
+                          try {
+                              reader.close();
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                  }
+                  return count;
+              }
+
+              public static String stackToString(Throwable t) {
+                  StringWriter sw = new StringWriter();
+                  PrintWriter pw = new PrintWriter(sw);
+                  t.printStackTrace(pw);
+                  pw.flush();
+                  return sw.toString();
+              }
+
+              private static String stackText(StackTraceElement[] st, int max) {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < st.length && i < max; i++) sb.append("      at ").append(st[i]).append('\n');
+                  if (st.length > max) sb.append("      ... ").append(st.length - max).append(" more\n");
+                  return sb.toString();
+              }
+
+              private static String allThreadStacks(int maxFrames) {
+                  StringBuilder sb = new StringBuilder();
+                  try {
+                      Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+                      List<Thread> threads = new ArrayList<Thread>(all.keySet());
+                      Collections.sort(threads, new Comparator<Thread>() {
+                          @Override
+                          public int compare(Thread a, Thread b) {
+                              return a.getName().compareTo(b.getName());
+                          }
+                      });
+                      for (Thread t : threads) {
+                          StackTraceElement[] st = all.get(t);
+                          sb.append("  thread \"").append(t.getName()).append("\" id=").append(t.getId()).append(" state=")
+                                  .append(t.getState()).append(t.isDaemon() ? " daemon" : "").append('\n');
+                          if (st != null) sb.append(stackText(st, maxFrames));
+                      }
+                  } catch (Throwable t) {
+                      sb.append("  thread dump failed: ").append(t).append('\n');
+                  }
+                  return sb.toString();
+              }
+
+              private static void installCrashHooks() {
+                  try {
+                      final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+                      Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                          @Override
+                          public void uncaughtException(Thread thread, Throwable error) {
+                              try {
+                                  failure("UNCAUGHT JAVA EXCEPTION on thread " + thread.getName(), error, "process is about to die");
+                              } catch (Throwable ignored) {
+                              }
+                              if (previous != null) previous.uncaughtException(thread, error);
+                          }
+                      });
+                      line("installed uncaught-exception hook (previous=" + previous + ")");
+                  } catch (Throwable t) {
+                      line("could not install uncaught-exception hook: " + t);
+                  }
+              }
+
+              private static void attachPreviousCrashes(Context ctx) {
+              }
+
+              private static void startLogcatTee() {
+              }
+
+              private static void extendWatch(long ms) {
+                  long until = SystemClock.elapsedRealtime() + ms;
+                  if (until > watchUntil) watchUntil = until;
+              }
+
+              private static void startThreadWatcher() {
+              }
+          }
+          '''
+
+
+          def patch_manifest_for_game_component_factory(manifest_path):
+              factory = "org.levimc.launcher.core.minecraft.GameComponentFactory"
+              text = manifest_path.read_text(encoding="utf-8")
+
+              manifest_match = re.search(r'<manifest\b[^>]*>', text)
+              if not manifest_match:
+                  raise SystemExit("AndroidManifest.xml has no <manifest> tag; refusing to guess")
+              manifest_tag = manifest_match.group(0)
+              if "xmlns:tools=" not in manifest_tag:
+                  new_manifest_tag = manifest_tag[:-1].rstrip() + ' xmlns:tools="http://schemas.android.com/tools">'
+                  text = text[:manifest_match.start()] + new_manifest_tag + text[manifest_match.end():]
+
+              app_match = re.search(r'<application\b[^>]*>', text)
+              if not app_match:
+                  raise SystemExit("AndroidManifest.xml has no <application> tag; refusing to guess")
+              tag = app_match.group(0)
+              if tag.endswith("/>"):
+                  raise SystemExit("Unexpected self-closing <application> tag")
+
+              if re.search(r'android:appComponentFactory\s*=', tag):
+                  new_tag = re.sub(
+                      r'android:appComponentFactory\s*=\s*"[^"]*"',
+                      'android:appComponentFactory="' + factory + '"',
+                      tag,
+                      count=1,
+                  )
+              else:
+                  new_tag = tag[:-1].rstrip() + '\n        android:appComponentFactory="' + factory + '">'
+
+              replace_match = re.search(r'tools:replace\s*=\s*"([^"]*)"', new_tag)
+              if replace_match:
+                  items = [i.strip() for i in replace_match.group(1).split(",") if i.strip()]
+                  if "android:appComponentFactory" not in items:
+                      items.append("android:appComponentFactory")
+                      new_tag = (
+                          new_tag[:replace_match.start()]
+                          + 'tools:replace="' + ",".join(items) + '"'
+                          + new_tag[replace_match.end():]
+                      )
+              else:
+                  new_tag = new_tag[:-1].rstrip() + '\n        tools:replace="android:appComponentFactory">'
+
+              text = text[:app_match.start()] + new_tag + text[app_match.end():]
+              manifest_path.write_text(text, encoding="utf-8")
+
+
+          def patch_minecraft_activity_super_failure(activity_path):
+              text = activity_path.read_text(encoding="utf-8")
+              marker = '"Mojang MainActivity super.onCreate failed"'
+              if text.count(marker) != 1:
+                  raise SystemExit("Could not find the unique 'super.onCreate failed' trace line in MinecraftActivity.kt")
+              idx = text.index(marker)
+              catches = list(re.finditer(r'catch\s*\(\s*(\w+)\s*:\s*Throwable\s*\)', text[:idx]))
+              if not catches:
+                  raise SystemExit("Could not find the Throwable catch that owns the 'super.onCreate failed' trace line")
+              var = catches[-1].group(1)
+              call = "returnToLauncherAfterLaunchFailure()"
+              cpos = text.find(call, idx)
+              if cpos < 0 or cpos - idx > 400:
+                  raise SystemExit("Could not find returnToLauncherAfterLaunchFailure() right after the 'super.onCreate failed' trace line")
+              line_start = text.rfind("\n", 0, cpos) + 1
+              indent = text[line_start:cpos]
+              if indent.strip():
+                  raise SystemExit("Unexpected layout around returnToLauncherAfterLaunchFailure(); refusing to patch")
+              replacement = (
+                  "GameClassLoaderBridge.reportActivityFailure(this, " + var + ")\n"
+                  + indent + "throw RuntimeException(\"Mojang MainActivity.onCreate failed [\" + GameClassLoaderBridge.describeActivity(this) + \"]: \" + " + var + ", " + var + ")"
+              )
+              text = text[:cpos] + replacement + text[cpos + len(call):]
+              activity_path.write_text(text, encoding="utf-8")
+
+
+          def install_game_loader_bridge(workspace, kotlin_text):
+              package_dir = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft"
+              manifest = workspace / "source/app/src/main/AndroidManifest.xml"
+              if not package_dir.is_dir():
+                  raise SystemExit(f"Launcher package directory missing: {package_dir}")
+              if not manifest.is_file():
+                  raise SystemExit(f"AndroidManifest.xml missing: {manifest}")
+              for name in ("GameClassLoaderBridge.kt", "GameComponentFactory.kt", "GameDiagnostics.java"):
+                  if (package_dir / name).exists():
+                      raise SystemExit(f"{name} already exists in the pinned source; refusing to overwrite it")
+
+              (package_dir / "GameClassLoaderBridge.kt").write_text(GAME_CLASS_LOADER_BRIDGE_KT, encoding="utf-8")
+              (package_dir / "GameComponentFactory.kt").write_text(GAME_COMPONENT_FACTORY_KT, encoding="utf-8")
+              (package_dir / "GameDiagnostics.java").write_text(GAME_DIAGNOSTICS_JAVA, encoding="utf-8")
+
+              anchor = "        val targetLoader = packageContext.classLoader\n"
+              if kotlin_text.count(anchor) != 1:
+                  raise SystemExit("Could not find the unique targetLoader line inside loadRuntimeNativeLibrary")
+              kotlin_text = kotlin_text.replace(
+                  anchor,
+                  "        val targetLoader: ClassLoader = GameClassLoaderBridge.obtainGameLoader(context)\n",
+                  1,
+              )
+
+              pairip_route = re.search(
+                  r'(?ms)^(?P<head>[ \t]*\}\s*else if \(normalizedName == "pairipcore"\) \{\n)'
+                  r'(?P<body>.*?)'
+                  r'(?P<tail>^[ \t]*\}\s*else if \(normalizedName == "PlayFabMultiplayer" \|\| normalizedName == "maesdk"\) \{)',
+                  kotlin_text,
+              )
+              if not pairip_route:
+                  raise SystemExit("Could not find the pairipcore route")
+              route_body = pairip_route.group("body")
+              pairip_call = re.compile(r'(?m)^([ \t]*)initializeOfficialPairIp\(\)[ \t]*$')
+              if len(pairip_call.findall(route_body)) != 1:
+                  raise SystemExit("Could not find exactly one initializeOfficialPairIp() call in the pairipcore route")
+              new_body = pairip_call.sub(
+                  lambda m: m.group(1) + "GameClassLoaderBridge.initializePairIp(context)", route_body, count=1
+              )
+              kotlin_text = kotlin_text[:pairip_route.start("body")] + new_body + kotlin_text[pairip_route.end("body"):]
+
+              begin_pat = re.compile(r'(?m)^([ \t]*)report\("Loading \$\{file\.name\} through Minecraft ClassLoader')
+              if len(begin_pat.findall(kotlin_text)) == 1:
+                  kotlin_text = begin_pat.sub(lambda m: m.group(1) + "GameDiagnostics.libLoadBegin(file)\n" + m.group(0), kotlin_text, count=1)
+              end_pat = re.compile(r'(?m)^([ \t]*)report\("Loaded \$\{file\.name\} through Minecraft ClassLoader namespace"\)[ \t]*$')
+              if len(end_pat.findall(kotlin_text)) == 1:
+                  kotlin_text = end_pat.sub(lambda m: m.group(0) + "\n" + m.group(1) + "GameDiagnostics.libLoadEnd(file)", kotlin_text, count=1)
+
+              patch_manifest_for_game_component_factory(manifest)
+              activity_file = package_dir / "MinecraftActivity.kt"
+              patch_minecraft_activity_super_failure(activity_file)
+              print("v27: dedicated game loader + BaseDexClassLoader ActivityRoutingLoader written.")
+              return kotlin_text
+
+
+          def verify_game_loader_bridge_in_apk(apk_path):
+              import zipfile
+
+              if not apk_path.is_file():
+                  raise SystemExit(f"Built APK not found for v27 verification: {apk_path}")
+              with zipfile.ZipFile(apk_path) as z:
+                  dex_blob = b"".join(
+                      z.read(n) for n in z.namelist() if re.fullmatch(r"classes\d*\.dex", n)
+                  )
+                  manifest_blob = z.read("AndroidManifest.xml")
+              for descriptor in (
+                  b"Lorg/levimc/launcher/core/minecraft/GameClassLoaderBridge;",
+                  b"Lorg/levimc/launcher/core/minecraft/GameComponentFactory;",
+                  b"Lorg/levimc/launcher/core/minecraft/GameDiagnostics;",
+              ):
+                  if descriptor not in dex_blob:
+                      raise SystemExit("APK is missing " + descriptor.decode())
+              if b"GameComponentFactory" not in manifest_blob and "GameComponentFactory".encode("utf-16-le") not in manifest_blob:
+                  raise SystemExit("APK manifest does not reference GameComponentFactory")
+              print("v27 verification passed.")
+
+
+          def prebuild_checks_and_safe_order():
+              manager = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt"
+              guard = workspace / "source/app/src/main/java/org/levimc/launcher/util/NativeImageGuard.java"
+              cmake = workspace / "source/app/src/main/cpp/CMakeLists.txt"
+              activity = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftActivity.kt"
+              for f in (manager, guard, cmake, activity):
+                  if not f.is_file():
+                      raise SystemExit(f"Required source file missing before build: {f}")
+
+              kotlin = manager.read_text(encoding="utf-8")
+
+              dep_pattern = re.compile(r'(?ms)^    private val runtimeDependencyLibs = arrayOf\(\n.*?^    \)')
+              dep_match = dep_pattern.search(kotlin)
+              if not dep_match:
+                  raise SystemExit("Could not find runtimeDependencyLibs to remove the duplicate PairIP entry")
+              dep_block = dep_match.group(0)
+              dep_line_pattern = re.compile(r'(?m)^[ \t]*"libpairipcore\.so",?[ \t]*\n')
+              dep_block = dep_line_pattern.sub("", dep_block, count=1)
+              kotlin = kotlin[:dep_match.start()] + dep_block + kotlin[dep_match.end():]
+
+              extraction_anchor = "        val apkFiles = collectApkFiles()\n"
+              stale_pairip_cleanup = '''        val stalePairIp = File(outputDir, "libpairipcore.so")
+                      if (stalePairIp.exists() && !stalePairIp.delete()) {
+                          throw IOException("Cannot remove stale cached PairIP copy: ${stalePairIp.absolutePath}")
+                      }
+                      report("Removed stale cached PairIP copy; using Minecraft parent-loader PairIP")
+                      val apkFiles = collectApkFiles()
+              '''
+              kotlin = kotlin.replace(extraction_anchor, stale_pairip_cleanup, 1)
+
+              native_method_pattern = re.compile(
+                  r'(?ms)^    private fun loadRuntimeNativeLibrary\(file: File\) \{\n.*?^    \}'
+              )
+              native_method_match = native_method_pattern.search(kotlin)
+              native_method = '''    private fun loadRuntimeNativeLibrary(file: File) {
+                  if (!file.isFile || file.length() == 0L) {
+                      throw UnsatisfiedLinkError("Native library is missing or empty: ${file.absolutePath}")
+                  }
+                  val targetLoader = packageContext.classLoader
+                  val method = synchronized(runtimeNativeLoaderLock) {
+                      runtimeNativeLoadMethod ?: java.lang.Runtime::class.java
+                          .getDeclaredMethod("load", String::class.java, ClassLoader::class.java)
+                          .apply { isAccessible = true }
+                          .also { runtimeNativeLoadMethod = it }
+                  }
+                  report("Loading ${file.name} through Minecraft ClassLoader ${targetLoader.javaClass.name}: ${file.absolutePath}")
+                  try {
+                      method.invoke(java.lang.Runtime.getRuntime(), file.absolutePath, targetLoader)
+                      report("Loaded ${file.name} through Minecraft ClassLoader namespace")
+                  } catch (e: InvocationTargetException) {
+                      val cause = e.targetException
+                      if (cause is UnsatisfiedLinkError) throw cause
+                      throw UnsatisfiedLinkError(
+                          "Minecraft ClassLoader failed to load ${file.name}: ${cause.message ?: cause.javaClass.simpleName}"
+                      ).also { it.initCause(cause) }
+                  } catch (e: Exception) {
+                      throw UnsatisfiedLinkError(
+                          "Could not load ${file.name} through Minecraft ClassLoader: ${e.message ?: e.javaClass.simpleName}"
+                      ).also { it.initCause(e) }
+                  }
+              }
+
+              '''
+              kotlin = kotlin[:native_method_match.start()] + native_method + kotlin[native_method_match.end():]
+              kotlin = kotlin.replace('import dalvik.system.DexClassLoader\n', '')
+
+              order_pattern = re.compile(r'(?ms)^[ \t]*val allLibs = buildList \{\n.*?^[ \t]*\}\.distinct\(\)')
+              order_replacement = '''        val allLibs = buildList {
+                          add("libpairipcore.so")
+                          add("libc++_shared.so")
+                          requiredLibs.filterNot { it == "libc++_shared.so" || it == "libminecraftpe.so" }.forEach { add(it) }
+                          optionalLibs.forEach { add(it) }
+                          add("libminecraftpe.so")
+                          systemLoadedLibs.filterNot { it == "libpairipcore.so" }.forEach { add(it) }
+                      }.distinct()'''
+              kotlin, _ = order_pattern.subn(order_replacement, kotlin, count=1)
+
+              app_gradle = workspace / "source/app/build.gradle"
+              gradle_text = app_gradle.read_text(encoding="utf-8")
+              debug_start = gradle_text.find("    debug {")
+              beta_start = gradle_text.find("    beta {", debug_start)
+              debug_block = gradle_text[debug_start:beta_start]
+              if "minifyEnabled true" in debug_block:
+                  patched_debug, _ = re.subn(
+                      r'(?m)^(?P<indent>[ \t]*)minifyEnabled true[ \t]*$',
+                      r'\g<indent>minifyEnabled false',
+                      debug_block,
+                      count=1,
+                  )
+                  gradle_text = gradle_text[:debug_start] + patched_debug + gradle_text[beta_start:]
+
+              target_pattern = re.compile(r'(?m)^(?P<indent>[ \t]*)targetSdkVersion[ \t]+35[ \t]*$')
+              gradle_text, _ = target_pattern.subn(r'\g<indent>targetSdkVersion 24', gradle_text, count=1)
+              app_gradle.write_text(gradle_text, encoding="utf-8")
+
+              kotlin = install_game_loader_bridge(workspace, kotlin)
+              manager.write_text(kotlin, encoding="utf-8")
+
+              activity_text = activity.read_text(encoding="utf-8")
+              old_activity_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  '            trace.error("MinecraftActivity prepare failed", formatLaunchFailure(throwable))',
+                  "            returnToLauncherAfterLaunchFailure()",
+                  "            return",
+                  "        }",
+              ])
+              new_activity_failure_branch = "\n".join([
+                  "        } catch (throwable: Throwable) {",
+                  "            trace.error(",
+                  '                "MinecraftActivity prepare failed",',
+                  "                android.util.Log.getStackTraceString(throwable)",
+                  "            )",
+                  "            throw IllegalStateException(",
+                  '                "MinecraftActivity runtime preparation failed before super.onCreate",',
+                  "                throwable",
+                  "            )",
+                  "        }",
+              ])
+              activity_text = activity_text.replace(old_activity_failure_branch, new_activity_failure_branch, 1)
+              activity.write_text(activity_text, encoding="utf-8")
+
+              loading_activity = workspace / "source/app/src/main/java/org/levimc/launcher/core/minecraft/MinecraftLoadingActivity.kt"
+              loading_text = loading_activity.read_text(encoding="utf-8")
+              old_show_failure = "\n".join([
+                  "    private fun showFailure(throwable: Throwable) {",
+                  "        if (isFinishing || isDestroyed) return",
+                  "        val message = throwable.message ?: throwable.javaClass.simpleName",
+                  "        updateProgress(100, getString(R.string.minecraft_loading_failed), null)",
+                  "        detailView.visibility = View.GONE",
+                  '        trace.error("Launch failed", message)',
+                  '        appendLog("Launch failed")',
+                  "        appendLog(message)",
+                  "        returnButton.visibility = View.VISIBLE",
+                  "    }",
+              ])
+              new_show_failure = "\n".join([
+                  "    private fun showFailure(throwable: Throwable) {",
+                  "        if (isFinishing || isDestroyed) return",
+                  "        val message = throwable.message ?: throwable.javaClass.simpleName",
+                  "        val stackTrace = android.util.Log.getStackTraceString(throwable)",
+                  "        updateProgress(100, getString(R.string.minecraft_loading_failed), null)",
+                  "        detailView.visibility = View.GONE",
+                  '        trace.error("Launch failed", stackTrace)',
+                  '        appendLog("Launch failed")',
+                  "        appendLog(message)",
+                  "        appendLog(stackTrace)",
+                  "        returnButton.visibility = View.VISIBLE",
+                  "    }",
+              ])
+              loading_text = loading_text.replace(old_show_failure, new_show_failure, 1)
+              loading_activity.write_text(loading_text, encoding="utf-8")
+
+          for step, script in recipe_run_steps:
+              name = str(step.get("name", "unnamed recipe step"))
+              step_id = str(step.get("id", ""))
+              if not condition_allows(step):
+                  continue
+              if step_id == "build":
+                  prebuild_checks_and_safe_order()
+
+              working = str(step.get("working-directory", ".")).replace("$" + "{{ github.workspace }}", str(workspace))
+              cwd = Path(working)
+              if not cwd.is_absolute():
+                  cwd = workspace / cwd
+
+              script = script.replace("$" + "{{ runner.temp }}", os.environ.get("RUNNER_TEMP", "/tmp"))
+              script = script.replace("$" + "{{ github.workspace }}", str(workspace))
+              if name == "Build debug APK for ARMv7 and capture all output":
+                  build_marker = './gradlew --no-daemon --stacktrace --info --console=plain :app:assembleDebug 2>&1 | tee "$LOG"'
+                  script = script.replace(
+                      build_marker,
+                      './gradlew --no-daemon --stacktrace --info --console=plain :app:assembleDebug -x :app:lintVitalDebug 2>&1 | tee "$LOG"',
+                      1,
+                  )
+              if name == "Verify the APK targets ARMv7":
+                  abi_marker = '''grep -q "native-code: 'armeabi-v7a'" /tmp/apk-badging.txt'''
+                  target_sdk_checks = "\n".join([
+                      abi_marker,
+                      "grep -q \"targetSdkVersion:'24'\" /tmp/apk-badging.txt",
+                      "echo \"Verified target SDK 24 for Android 10 Runtime.load(ClassLoader) compatibility.\"",
+                  ])
+                  script = script.replace(abi_marker, target_sdk_checks, 1)
+
+              child_env = os.environ.copy()
+              for key, value in (step.get("env") or {}).items():
+                  child_env[str(key)] = str(value)
+
+              print(f"\n::group::v27 diagnostic recipe step: {name}")
+              run_count += 1
+              result = subprocess.run(script, shell=True, executable="/bin/bash", cwd=cwd, env=child_env)
+              print("::endgroup::")
+              if result.returncode != 0:
+                  any_failed = True
+                  if step_id == "build":
+                      build_failed = True
+
+          if run_count < 9 or any_failed:
+              raise SystemExit("One or more v27 build steps failed; inspect the uploaded build log")
+          verify_game_loader_bridge_in_apk(workspace / "LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v27.apk")
+          PY
+
+      - name: Show compile errors (copy these lines if the build fails)
+        if: always()
+        shell: bash
+        run: |
+          LOG="${{ runner.temp }}/gradle-native-build.log"
+          {
+            echo "## Build error summary"
+            if [ -f "$LOG" ]; then
+              echo '```'
+              grep -n -E "^e: |: error: |Unresolved reference|What went wrong|Execution failed for task" "$LOG" | cut -c1-400 | head -60 || true
+              echo '```'
+            else
+              echo "No Gradle log found at $LOG"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full build log for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-build-log-v27
+          path: ${{ runner.temp }}/gradle-native-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload installable ARMv7 APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-APK-v27
+          path: LeviLauncher-ARMv7-PAIRIP-CLASSLOADER-debug-v27.apk
+          if-no-files-found: error
+          retention-days: 7
