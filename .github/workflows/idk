@@ -1,2 +1,12 @@
-- name: Extract launcher project
+name: Build ARMv7 Launcher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Workflow started successfully"
   run: unzip MCPE_12652_ARMv7_Launcher.zip -d launcher
