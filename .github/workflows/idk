@@ -1,0 +1,2 @@
+- name: Extract launcher project
+  run: unzip MCPE_12652_ARMv7_Launcher.zip -d launcher
