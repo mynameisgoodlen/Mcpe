@@ -1,0 +1,585 @@
+name: Single-File ARMv7 Native Bootstrap Builder
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-armv7-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 10 (API 29), NDK & CMake
+        run: |
+          sdkmanager --install "platforms;android-29" "build-tools;34.0.0" "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Generate Entire Project Structure Automatically
+        run: |
+          mkdir -p app/src/main/cpp
+          mkdir -p app/src/main/java/com/mclauncher/armv7
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MC-ARMv7-Bootstrap"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.mclauncher.armv7'
+              compileSdk 29
+
+              defaultConfig {
+                  applicationId "com.mclauncher.armv7"
+                  minSdk 26
+                  targetSdk 29
+                  versionCode 1
+                  versionName "1.0-armv7"
+
+                  ndk {
+                      abiFilters "armeabi-v7a"
+                  }
+
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags "-std=c++17 -Wall -Wextra"
+                          arguments "-DANDROID_ABI=armeabi-v7a",
+                                    "-DANDROID_PLATFORM=android-29",
+                                    "-DANDROID_STL=c++_shared"
+                      }
+                  }
+              }
+
+              buildTypes {
+                  debug {
+                      debuggable true
+                      jniDebuggable true
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path file('src/main/cpp/CMakeLists.txt')
+                      version '3.22.1'
+                  }
+              }
+
+              packagingOptions {
+                  jniLibs {
+                      useLegacyPackaging true
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.mclauncher.armv7">
+
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
+              <application
+                  android:allowBackup="false"
+                  android:extractNativeLibs="true"
+                  android:hardwareAccelerated="true"
+                  android:label="MC ARMv7 Bootstrap"
+                  android:largeHeap="true">
+
+                  <activity
+                      android:name=".BootstrapActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="sensorLandscape"
+                      android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("mc_bootstrap" LANGUAGES CXX)
+
+          if(NOT ANDROID_ABI STREQUAL "armeabi-v7a")
+              message(FATAL_ERROR "Strictly armeabi-v7a only. Current ABI: ${ANDROID_ABI}")
+          endif()
+
+          add_library(mc_bootstrap SHARED mc_bootstrap.cpp)
+
+          find_library(log-lib log)
+          find_library(android-lib android)
+          find_library(dl-lib dl)
+          find_library(egl-lib EGL)
+          find_library(glesv2-lib GLESv2)
+
+          target_link_libraries(mc_bootstrap
+              ${log-lib}
+              ${android-lib}
+              ${dl-lib}
+              ${egl-lib}
+              ${glesv2-lib}
+          )
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/mc_bootstrap.cpp
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <string>
+          #include <vector>
+          #include <sstream>
+          #include <elf.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+
+          #define LOG_TAG "MC_ARMv7_Bootstrap"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace {
+
+          struct LoadedLibrary {
+              std::string name;
+              void* handle;
+          };
+
+          std::vector<LoadedLibrary> g_loadedLibs;
+
+          void AppendLog(std::ostringstream& oss, const std::string& msg) {
+              LOGI("%s", msg.c_str());
+              oss << msg << "\n";
+          }
+
+          void AppendErr(std::ostringstream& oss, const std::string& msg) {
+              LOGE("%s", msg.c_str());
+              oss << "[ERROR] " << msg << "\n";
+          }
+
+          bool VerifyElfArmv7(const std::string& path, std::ostringstream& log) {
+              int fd = open(path.c_str(), O_RDONLY);
+              if (fd < 0) {
+                  AppendErr(log, "Cannot open file for ELF verification: " + path);
+                  return false;
+              }
+
+              Elf32_Ehdr ehdr{};
+              ssize_t bytes = read(fd, &ehdr, sizeof(ehdr));
+              close(fd);
+
+              if (bytes != sizeof(ehdr)) {
+                  AppendErr(log, "Short read on ELF header: " + path);
+                  return false;
+              }
+
+              if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
+                  ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+                  ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
+                  ehdr.e_ident[EI_MAG3] != ELFMAG3) {
+                  AppendErr(log, "Invalid ELF magic in: " + path);
+                  return false;
+              }
+
+              if (ehdr.e_ident[EI_CLASS] != ELFCLASS32 || ehdr.e_machine != EM_ARM) {
+                  AppendErr(log, "ELF is not 32-bit ARM (EM_ARM): " + path);
+                  return false;
+              }
+
+              AppendLog(log, "[ELF OK] 32-bit EM_ARM (ET_DYN) verified: " + path);
+              return true;
+          }
+
+          } // namespace
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* /*vm*/, void* /*reserved*/) {
+              LOGI("libmc_bootstrap.so JNI_OnLoad initialized (32-bit ARMv7, sizeof(void*)=%zu)", sizeof(void*));
+              return JNI_VERSION_1_6;
+          }
+
+          extern "C"
+          JNIEXPORT jstring JNICALL
+          Java_com_mclauncher_armv7_BootstrapActivity_nativeBootstrapRuntime(
+                  JNIEnv* env,
+                  jclass /*clazz*/,
+                  jstring jNativeLibDir,
+                  jboolean includePairipLibs) {
+
+              std::ostringstream report;
+              AppendLog(report, "=== Phase 1: Native Bootstrapper Environment Check ===");
+              AppendLog(report, "Pointer size: " + std::to_string(sizeof(void*) * 8) + "-bit (Expected: 32-bit ARMv7)");
+
+              const char* cLibDir = env->GetStringUTFChars(jNativeLibDir, nullptr);
+              std::string libDir(cLibDir ? cLibDir : "");
+              env->ReleaseStringUTFChars(jNativeLibDir, cLibDir);
+
+              if (libDir.empty()) {
+                  AppendErr(report, "Native library directory path is empty.");
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              AppendLog(report, "Target native library directory: " + libDir);
+
+              const char* sysLibs[] = {"liblog.so", "libdl.so", "libm.so", "libc.so", "libz.so", "libandroid.so", "libEGL.so", "libGLESv2.so"};
+              for (const char* sysLib : sysLibs) {
+                  void* h = dlopen(sysLib, RTLD_NOW | RTLD_GLOBAL);
+                  if (!h) {
+                      AppendErr(report, std::string("Failed to dlopen system library ") + sysLib + ": " + dlerror());
+                  }
+              }
+
+              std::vector<std::string> baseChain = {
+                  "libc++_shared.so",
+                  "libfmod.so",
+                  "libHttpClient.Android.so",
+                  "libMediaDecoders_Android.so",
+                  "libconscrypt_jni.so"
+              };
+
+              std::vector<std::string> protectedChain = {
+                  "libpairipcore.so",
+                  "libmaesdk.so",
+                  "libPlayFabMultiplayer.so",
+                  "libminecraftpe.so"
+              };
+
+              AppendLog(report, "\n=== Phase 2: Loading Base ARMv7 Native Libraries ===");
+              for (const auto& libName : baseChain) {
+                  std::string fullPath = libDir + "/" + libName;
+                  if (!VerifyElfArmv7(fullPath, report)) {
+                      return env->NewStringUTF(report.str().c_str());
+                  }
+                  dlerror();
+                  void* handle = dlopen(fullPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                  if (!handle) {
+                      const char* err = dlerror();
+                      AppendErr(report, "dlopen failed for " + libName + ": " + (err ? err : "unknown error"));
+                      return env->NewStringUTF(report.str().c_str());
+                  }
+                  g_loadedLibs.push_back({libName, handle});
+                  AppendLog(report, "[LOADED] " + libName);
+              }
+
+              if (!includePairipLibs) {
+                  AppendLog(report, "\n[INFO] Stopped before PairIP-protected libraries (safe inspection mode).");
+                  AppendLog(report, "All 5 non-DRM ARMv7 libraries loaded and linked cleanly in this process.");
+                  return env->NewStringUTF(report.str().c_str());
+              }
+
+              AppendLog(report, "\n=== Phase 3: Loading PairIP & Core Engine Chain ===");
+              for (const auto& libName : protectedChain) {
+                  std::string fullPath = libDir + "/" + libName;
+                  if (!VerifyElfArmv7(fullPath, report)) {
+                      return env->NewStringUTF(report.str().c_str());
+                  }
+                  dlerror();
+                  void* handle = dlopen(fullPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                  if (!handle) {
+                      const char* err = dlerror();
+                      AppendErr(report, "dlopen failed for " + libName + ": " + (err ? err : "unknown error"));
+                      return env->NewStringUTF(report.str().c_str());
+                  }
+                  g_loadedLibs.push_back({libName, handle});
+                  AppendLog(report, "[LOADED] " + libName);
+
+                  if (libName == "libpairipcore.so") {
+                      void* execSym = dlsym(handle, "ExecuteProgram");
+                      AppendLog(report, std::string("Resolved libpairipcore.so::ExecuteProgram = ") + (execSym ? "FOUND" : "MISSING"));
+                  }
+
+                  if (libName == "libminecraftpe.so") {
+                      void* jniOnLoadSym = dlsym(handle, "JNI_OnLoad");
+                      void* gameActInitSym = dlsym(handle, "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode");
+                      void* gameActOnCreateSym = dlsym(handle, "GameActivity_onCreate");
+
+                      AppendLog(report, std::string("Resolved libminecraftpe.so::JNI_OnLoad = ") + (jniOnLoadSym ? "FOUND" : "MISSING"));
+                      AppendLog(report, std::string("Resolved GameActivity_initializeNativeCode = ") + (gameActInitSym ? "FOUND" : "MISSING"));
+                      AppendLog(report, std::string("Resolved GameActivity_onCreate = ") + (gameActOnCreateSym ? "FOUND" : "MISSING"));
+                  }
+              }
+
+              return env->NewStringUTF(report.str().c_str());
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mclauncher/armv7/BootstrapActivity.java
+          package com.mclauncher.armv7;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.util.ArrayList;
+          import java.util.Enumeration;
+          import java.util.List;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+
+          import dalvik.system.DexClassLoader;
+
+          public class BootstrapActivity extends Activity {
+
+              public static final String MC_PACKAGE = "com.mojang.minecraftpe";
+
+              static {
+                  System.loadLibrary("mc_bootstrap");
+              }
+
+              public static native String nativeBootstrapRuntime(String nativeLibDir, boolean includePairipLibs);
+
+              private TextView logView;
+              private PackageInspectionResult runtimeInfo;
+
+              public static class PackageInspectionResult {
+                  public boolean installed;
+                  public String baseApkPath;
+                  public final List<String> splitApkPaths = new ArrayList<>();
+                  public String armv7SplitPath;
+                  public String stagedLibDir;
+                  public DexClassLoader bridgedClassLoader;
+                  public String diagnosticLog;
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.parseColor("#121212"));
+                  int pad = (int) (12 * getResources().getDisplayMetrics().density);
+                  root.setPadding(pad, pad, pad, pad);
+
+                  LinearLayout buttonRow = new LinearLayout(this);
+                  buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+                  buttonRow.setGravity(Gravity.CENTER_VERTICAL);
+
+                  Button btnSafeStage = new Button(this);
+                  btnSafeStage.setText("1. Bootstrap Base ARMv7 Libs");
+
+                  Button btnFullStage = new Button(this);
+                  btnFullStage.setText("2. Bootstrap Full Engine (PairIP + MCPE)");
+
+                  buttonRow.addView(btnSafeStage, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  buttonRow.addView(btnFullStage, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  ScrollView scroll = new ScrollView(this);
+                  logView = new TextView(this);
+                  logView.setTextColor(Color.parseColor("#00E676"));
+                  logView.setTypeface(Typeface.MONOSPACE);
+                  logView.setTextSize(12f);
+                  scroll.addView(logView);
+
+                  root.addView(buttonRow, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  root.addView(scroll, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  setContentView(root);
+
+                  appendLog("Preparing installed com.mojang.minecraftpe split APKs (async)...");
+                  new Thread(() -> {
+                      PackageInspectionResult info = prepareInstalledRuntime(getApplicationContext());
+                      runOnUiThread(() -> {
+                          runtimeInfo = info;
+                          logView.setText(info.diagnosticLog);
+                      });
+                  }).start();
+
+                  btnSafeStage.setOnClickListener(v -> runBootstrap(false));
+                  btnFullStage.setOnClickListener(v -> runBootstrap(true));
+              }
+
+              private void runBootstrap(boolean includePairip) {
+                  if (runtimeInfo == null || !runtimeInfo.installed || runtimeInfo.stagedLibDir == null) {
+                      appendLog("\n[ABORT] Runtime is not ready or com.mojang.minecraftpe is not installed.");
+                      return;
+                  }
+                  appendLog("\nInvoking JNI nativeBootstrapRuntime(includePairip=" + includePairip + ")...");
+                  new Thread(() -> {
+                      String result = nativeBootstrapRuntime(runtimeInfo.stagedLibDir, includePairip);
+                      runOnUiThread(() -> appendLog("\n" + result));
+                  }).start();
+              }
+
+              private void appendLog(String text) {
+                  logView.append(text + "\n");
+              }
+
+              public static PackageInspectionResult prepareInstalledRuntime(Context hostContext) {
+                  PackageInspectionResult res = new PackageInspectionResult();
+                  StringBuilder log = new StringBuilder();
+
+                  log.append("=== Device & ABI Inspection ===\n");
+                  log.append("Model: ").append(Build.MODEL).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+                  log.append("Supported ABIs: ").append(String.join(", ", Build.SUPPORTED_ABIS)).append("\n\n");
+
+                  try {
+                      PackageManager pm = hostContext.getPackageManager();
+                      PackageInfo pkgInfo = pm.getPackageInfo(MC_PACKAGE, 0);
+                      ApplicationInfo appInfo = pkgInfo.applicationInfo;
+
+                      res.installed = true;
+                      res.baseApkPath = appInfo.publicSourceDir;
+                      log.append("=== Official Minecraft Installation Found ===\n");
+                      log.append("Version: ").append(pkgInfo.versionName)
+                         .append(" (").append(pkgInfo.getLongVersionCode()).append(")\n");
+                      log.append("Base APK: ").append(res.baseApkPath).append("\n");
+
+                      if (appInfo.splitPublicSourceDirs != null) {
+                          for (String split : appInfo.splitPublicSourceDirs) {
+                              res.splitApkPaths.add(split);
+                              log.append("Split APK: ").append(split).append("\n");
+                              if (split.contains("armeabi_v7a") || split.contains("arm")) {
+                                  res.armv7SplitPath = split;
+                              }
+                          }
+                      }
+
+                      String sourceApkForLibs = (res.armv7SplitPath != null) ? res.armv7SplitPath : res.baseApkPath;
+                      File stageDir = new File(hostContext.getFilesDir(), "mc_armv7_libs");
+                      if (!stageDir.exists()) {
+                          stageDir.mkdirs();
+                      }
+
+                      int extractedCount = extractArmv7Libs(sourceApkForLibs, stageDir, log);
+                      if (extractedCount == 0 && res.armv7SplitPath == null && appInfo.nativeLibraryDir != null) {
+                          res.stagedLibDir = appInfo.nativeLibraryDir;
+                          log.append("Using system nativeLibraryDir: ").append(res.stagedLibDir).append("\n");
+                      } else {
+                          res.stagedLibDir = stageDir.getAbsolutePath();
+                          log.append("Staged ").append(extractedCount).append(" armeabi-v7a libraries to: ")
+                             .append(res.stagedLibDir).append("\n");
+                      }
+
+                      File optimizedDir = hostContext.getCodeCacheDir();
+                      res.bridgedClassLoader = new DexClassLoader(
+                              res.baseApkPath,
+                              optimizedDir.getAbsolutePath(),
+                              res.stagedLibDir,
+                              hostContext.getClassLoader()
+                      );
+
+                      Class<?> gameActivityClass = res.bridgedClassLoader.loadClass("com.google.androidgamesdk.GameActivity");
+                      Class<?> fmodClass = res.bridgedClassLoader.loadClass("org.fmod.FMOD");
+                      log.append("[DEX OK] Loaded GameActivity: ").append(gameActivityClass.getName()).append("\n");
+                      log.append("[DEX OK] Loaded FMOD: ").append(fmodClass.getName()).append("\n");
+
+                  } catch (PackageManager.NameNotFoundException e) {
+                      res.installed = false;
+                      log.append("[ERROR] Package ").append(MC_PACKAGE).append(" is not installed on this device.\n");
+                  } catch (Throwable t) {
+                      log.append("[ERROR] Exception during runtime preparation: ").append(t.toString()).append("\n");
+                  }
+
+                  res.diagnosticLog = log.toString();
+                  return res;
+              }
+
+              private static int extractArmv7Libs(String apkPath, File destDir, StringBuilder log) {
+                  int count = 0;
+                  try (ZipFile zip = new ZipFile(apkPath)) {
+                      Enumeration<? extends ZipEntry> entries = zip.entries();
+                      byte[] buffer = new byte[65536];
+                      while (entries.hasMoreElements()) {
+                          ZipEntry entry = entries.nextElement();
+                          String name = entry.getName();
+                          if (name.startsWith("lib/armeabi-v7a/") && name.endsWith(".so")) {
+                              String fileName = name.substring("lib/armeabi-v7a/".length());
+                              File outFile = new File(destDir, fileName);
+                              if (!outFile.exists() || outFile.length() != entry.getSize()) {
+                                  if (outFile.exists()) {
+                                      outFile.setWritable(true);
+                                  }
+                                  try (InputStream is = zip.getInputStream(entry);
+                                       FileOutputStream fos = new FileOutputStream(outFile)) {
+                                      int read;
+                                      while ((read = is.read(buffer)) != -1) {
+                                          fos.write(buffer, 0, read);
+                                      }
+                                  }
+                                  outFile.setReadOnly();
+                              }
+                              count++;
+                          }
+                      }
+                  } catch (Exception e) {
+                      log.append("[WARN] Failed scanning ").append(apkPath).append(": ").append(e.getMessage()).append("\n");
+                  }
+                  return count;
+              }
+          }
+          EOF
+
+      - name: Build Debug APK (armeabi-v7a only)
+        run: |
+          gradle assembleDebug --no-daemon
+
+      - name: Verify APK ABI Contents (Ensure 32-bit ARMv7 Only)
+        run: |
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep "lib/"
+          if unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q "lib/arm64-v8a/"; then
+            echo "ERROR: arm64-v8a libraries detected!"
+            exit 1
+          fi
+
+      - name: Upload ARMv7 APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-armv7-bootstrap-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
