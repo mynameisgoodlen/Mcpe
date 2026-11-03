@@ -1,0 +1,270 @@
+name: LeviLauncher v1.5.27 ARMv7 port gate
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/armv7-port.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  armv7-port:
+    name: Build and verify real ARMv7 launcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout the Mcpe workflow repository
+        uses: actions/checkout@v4
+
+      - name: Checkout exact LeviLauncher source and pinned submodules
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: a8531393d3a336812748a9bb45582a3d9791af7b
+          path: upstream
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Java 21 (required by pinned upstream build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the Android versions pinned by upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;28.2.13676358' \
+            'cmake;3.22.1'
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          test -f "${SDK_ROOT}/ndk/28.2.13676358/build/cmake/android.toolchain.cmake"
+
+      - name: Confirm the exact source, submodules and expected build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f upstream/gradlew
+          test -f upstream/app/build.gradle
+          test -f upstream/app/src/main/cpp/CMakeLists.txt
+          test -f upstream/app/src/main/cpp/preloader/CMakeLists.txt
+          test -f upstream/app/src/main/cpp/libHttpClient/Build/libHttpClient.Android/CMakeLists.txt
+          grep -F 'abiFilters '\''arm64-v8a'\''' upstream/app/build.gradle
+          grep -F 'ndkVersion = "28.2.13676358"' upstream/app/build.gradle
+          grep -F 'distributionUrl=https\://services.gradle.org/distributions/gradle-8.13-bin.zip' upstream/gradle/wrapper/gradle-wrapper.properties
+          git -C upstream rev-parse HEAD | tee upstream-revision.txt
+          test "$(cat upstream-revision.txt)" = 'a8531393d3a336812748a9bb45582a3d9791af7b'
+
+      - name: Build the open-source native subprojects for armeabi-v7a
+        id: native_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          mkdir -p port-output/armeabi-v7a
+          cmake \
+            -S upstream/app/src/main/cpp \
+            -B build-armv7 \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            > native-build.log 2>&1
+          result=$?
+          if [ "$result" -eq 0 ]; then
+            cmake --build build-armv7 --parallel 2 >> native-build.log 2>&1
+            result=$?
+          fi
+          find build-armv7 -type f \( -name 'libpreloader.so' -o -name 'libHttpClient.Android.so' \) -exec cp -v {} port-output/armeabi-v7a/ \; 2>> native-build.log
+          cat native-build.log
+          echo "exit_code=$result" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Audit every required native dependency (must be ELF32 / EM_ARM)
+        id: native_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > /tmp/audit_native.py <<'PY'
+          import argparse
+          import struct
+          from pathlib import Path
+
+          REQUIRED = [
+              'libgxcore.so',
+              'libmaesdk.so',
+              'libPlayFabMultiplayer.so',
+              'libinbuiltmods.so',
+              'libpreloader.so',
+              'libHttpClient.Android.so',
+          ]
+
+          def inspect(path):
+              try:
+                  with path.open('rb') as f:
+                      h = f.read(64)
+                  if len(h) < 20 or h[:4] != b'\x7fELF':
+                      return 'NOT_ELF'
+                  cls = h[4]
+                  endian = h[5]
+                  if endian not in (1, 2):
+                      return 'BAD_ENDIAN'
+                  machine = struct.unpack_from('<H' if endian == 1 else '>H', h, 18)[0]
+                  if cls == 1 and machine == 40:
+                      return 'ELF32_ARM'
+                  if cls == 2 and machine == 183:
+                      return 'ELF64_AARCH64'
+                  return f'OTHER(class={cls},machine={machine})'
+              except OSError as e:
+                  return f'UNREADABLE({e})'
+
+          ap = argparse.ArgumentParser()
+          ap.add_argument('--roots', nargs='+', required=True)
+          ap.add_argument('--report', required=True)
+          args = ap.parse_args()
+          files = []
+          for root in args.roots:
+              p = Path(root)
+              if p.exists():
+                  files.extend(x for x in p.rglob('*.so') if x.is_file())
+          by_name = {}
+          for f in files:
+              by_name.setdefault(f.name, []).append(f)
+
+          lines = [
+              'LeviLauncher v1.5.27 ARMv7 native dependency audit',
+              'Expected ABI: armeabi-v7a (ELFCLASS32 + EM_ARM=40)',
+              'Pinned upstream: a8531393d3a336812748a9bb45582a3d9791af7b',
+              '',
+          ]
+          failures = []
+          for name in REQUIRED:
+              candidates = by_name.get(name, [])
+              if not candidates:
+                  lines.append(f'BLOCKED  {name}: NOT FOUND')
+                  failures.append(name)
+                  continue
+              results = [(p, inspect(p)) for p in candidates]
+              good = [(p, arch) for p, arch in results if arch == 'ELF32_ARM']
+              for p, arch in results:
+                  lines.append(f'  {arch:18} {p}')
+              if good:
+                  lines.append(f'PASS     {name}: ARMv7 candidate found')
+              else:
+                  lines.append(f'BLOCKED  {name}: no ELF32 ARM candidate')
+                  failures.append(name)
+              lines.append('')
+
+          lines += [
+              f'Native .so files scanned: {len(files)}',
+              f'Required libraries blocked: {len(failures)}',
+              'AArch64 binaries are not compatible with a 32-bit ARM process.',
+              'This audit does not claim runtime compatibility; device testing is still required.',
+          ]
+          report = '\n'.join(lines) + '\n'
+          Path(args.report).write_text(report, encoding='utf-8')
+          print(report)
+          raise SystemExit(1 if failures else 0)
+          PY
+          python3 /tmp/audit_native.py \
+            --roots upstream/app/src/main build-armv7 port-output \
+            --report armv7-native-audit.txt
+
+      - name: Stop rather than emit a fake or incomplete APK
+        if: steps.native_build.outcome != 'success' || steps.native_audit.outcome != 'success'
+        shell: bash
+        run: |
+          echo '::error::ARMv7 port is blocked: one or more real native dependencies are missing or are not ELF32 ARM. No launcher APK will be labelled as usable.'
+          echo 'Read armv7-native-audit.txt and native-build.log in the uploaded preflight artifact.'
+          exit 1
+
+      - name: Switch only the upstream app ABI filter to ARMv7
+        if: steps.native_build.outcome == 'success' && steps.native_audit.outcome == 'success'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/app/build.gradle')
+          s = p.read_text(encoding='utf-8')
+          old = "abiFilters 'arm64-v8a'"
+          new = "abiFilters 'armeabi-v7a'"
+          if s.count(old) != 1:
+              raise SystemExit(f'Expected exactly one {old!r}; found {s.count(old)}')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+
+      - name: Build the actual LeviLauncher debug APK
+        if: steps.native_build.outcome == 'success' && steps.native_audit.outcome == 'success'
+        working-directory: upstream
+        shell: bash
+        run: ./gradlew --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify the APK contains only working 32-bit ARM native libraries
+        if: steps.native_build.outcome == 'success' && steps.native_audit.outcome == 'success'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import struct, zipfile
+          from pathlib import Path
+          apk = Path('upstream/app/build/outputs/apk/debug/app-debug.apk')
+          if not apk.is_file():
+              raise SystemExit(f'APK not produced: {apk}')
+          required = {
+              'libgxcore.so', 'libmaesdk.so', 'libPlayFabMultiplayer.so',
+              'libinbuiltmods.so', 'libpreloader.so', 'libHttpClient.Android.so'
+          }
+          found = set()
+          errors = []
+          with zipfile.ZipFile(apk) as z:
+              entries = [n for n in z.namelist() if n.startswith('lib/') and n.endswith('.so')]
+              if not entries:
+                  errors.append('APK contains no JNI shared libraries')
+              for name in entries:
+                  parts = name.split('/')
+                  if len(parts) != 3 or parts[1] != 'armeabi-v7a':
+                      errors.append(f'Wrong ABI directory: {name}')
+                      continue
+                  data = z.read(name)[:64]
+                  if len(data) < 20 or data[:4] != b'\x7fELF' or data[4] != 1:
+                      errors.append(f'Not ELF32: {name}')
+                      continue
+                  endian = data[5]
+                  machine = struct.unpack_from('<H' if endian == 1 else '>H', data, 18)[0]
+                  if machine != 40:
+                      errors.append(f'Not EM_ARM: {name} (e_machine={machine})')
+                  found.add(parts[2])
+          missing = sorted(required - found)
+          if missing:
+              errors.append('Missing required native libraries: ' + ', '.join(missing))
+          if errors:
+              raise SystemExit('\n'.join(errors))
+          print(f'PASS: {apk} contains {len(found)} native libraries, all ELF32/EM_ARM.')
+          PY
+
+      - name: Upload ARMv7 audit and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: levilauncher-armv7-port-evidence
+          if-no-files-found: warn
+          path: |
+            armv7-native-audit.txt
+            native-build.log
+            upstream-revision.txt
+            port-output/**
+            upstream/app/build/outputs/apk/debug/app-debug.apk
+            upstream/app/build/reports/**
+
