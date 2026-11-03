@@ -1,0 +1,514 @@
+name: Build Genuine ARMv7 libgxcore.so & Integrate Launcher
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-armv7-gxcore:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK & NDK r25b (API 29)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-29 build-tools;34.0.0 ndk;25.2.9519653 cmake;3.22.1'
+
+      - name: Generate & Compile Genuine ARMv7 libgxcore.so
+        run: |
+          mkdir -p gxcore_build/src
+          cat << 'EOF' > gxcore_build/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("gxcore" LANGUAGES CXX)
+
+          if(NOT ANDROID_ABI STREQUAL "armeabi-v7a")
+              message(FATAL_ERROR "Target ABI must be armeabi-v7a. Got: ${ANDROID_ABI}")
+          endif()
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-soname,libgxcore.so -Wl,--no-undefined")
+
+          add_library(gxcore SHARED src/gxcore_armv7.cpp)
+
+          find_library(log-lib log)
+          find_library(dl-lib dl)
+          find_library(android-lib android)
+          find_library(z-lib z)
+
+          target_link_libraries(gxcore
+              ${log-lib}
+              ${dl-lib}
+              ${android-lib}
+              ${z-lib}
+          )
+          EOF
+
+          cat << 'EOF' > gxcore_build/src/gxcore_armv7.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <elf.h>
+          #include <fcntl.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+          #include <mutex>
+          #include <dirent.h>
+
+          #define LOG_TAG "GXCore_ARMv7"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace gxcore {
+
+          static std::mutex g_mutex;
+          static bool g_bootstrapped = false;
+          static std::string g_modsPath;
+          static std::string g_lastScannedDir;
+          static std::vector<void*> g_preloadedHandles;
+
+          struct Elf32AuditResult {
+              bool validElf32Arm = false;
+              bool hasDynamicTable = false;
+              bool hasDtInit = false;
+              uint32_t dtInitOffset = 0;
+              std::string soname;
+              std::vector<std::string> neededLibs;
+          };
+
+          static std::string JStringToStdString(JNIEnv* env, jstring jstr) {
+              if (!jstr) return "";
+              const char* chars = env->GetStringUTFChars(jstr, nullptr);
+              if (!chars) return "";
+              std::string result(chars);
+              env->ReleaseStringUTFChars(jstr, chars);
+              return result;
+          }
+
+          static std::string DirNameOf(const std::string& filePath) {
+              size_t pos = filePath.find_last_of('/');
+              if (pos == std::string::npos) return "";
+              return filePath.substr(0, pos);
+          }
+
+          static bool InspectElf32Image(const std::string& path, Elf32AuditResult& out) {
+              out = Elf32AuditResult{};
+              int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+              if (fd < 0) {
+                  LOGE("InspectElf32Image: unable to open %s", path.c_str());
+                  return false;
+              }
+
+              struct stat st{};
+              if (fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(Elf32_Ehdr))) {
+                  close(fd);
+                  LOGE("InspectElf32Image: file too small %s", path.c_str());
+                  return false;
+              }
+
+              size_t fileSize = static_cast<size_t>(st.st_size);
+              void* mapped = mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+              close(fd);
+              if (mapped == MAP_FAILED) {
+                  LOGE("InspectElf32Image: mmap failed for %s", path.c_str());
+                  return false;
+              }
+
+              const uint8_t* base = static_cast<const uint8_t*>(mapped);
+              const Elf32_Ehdr* ehdr = reinterpret_cast<const Elf32_Ehdr*>(base);
+
+              if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+                  ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+                  ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+                  ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
+                  ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+                  ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+                  ehdr->e_machine != EM_ARM ||
+                  ehdr->e_type != ET_DYN) {
+                  LOGE("InspectElf32Image: %s is not a valid 32-bit EM_ARM ET_DYN shared library", path.c_str());
+                  munmap(mapped, fileSize);
+                  return false;
+              }
+
+              out.validElf32Arm = true;
+
+              if (ehdr->e_shoff > 0 &&
+                  ehdr->e_shentsize == sizeof(Elf32_Shdr) &&
+                  static_cast<size_t>(ehdr->e_shoff) + static_cast<size_t>(ehdr->e_shnum) * sizeof(Elf32_Shdr) <= fileSize) {
+
+                  const Elf32_Shdr* shdrs = reinterpret_cast<const Elf32_Shdr*>(base + ehdr->e_shoff);
+                  const Elf32_Shdr* dynSec = nullptr;
+                  for (uint16_t i = 0; i < ehdr->e_shnum; ++i) {
+                      if (shdrs[i].sh_type == SHT_DYNAMIC) {
+                          dynSec = &shdrs[i];
+                          break;
+                      }
+                  }
+
+                  if (dynSec && dynSec->sh_link < ehdr->e_shnum) {
+                      const Elf32_Shdr* strSec = &shdrs[dynSec->sh_link];
+                      if (dynSec->sh_offset + dynSec->sh_size <= fileSize &&
+                          strSec->sh_offset + strSec->sh_size <= fileSize) {
+                          out.hasDynamicTable = true;
+                          const char* dynstr = reinterpret_cast<const char*>(base + strSec->sh_offset);
+                          size_t dynstrSize = strSec->sh_size;
+                          const Elf32_Dyn* dyns = reinterpret_cast<const Elf32_Dyn*>(base + dynSec->sh_offset);
+                          size_t dynCount = dynSec->sh_size / sizeof(Elf32_Dyn);
+
+                          for (size_t i = 0; i < dynCount; ++i) {
+                              if (dyns[i].d_tag == DT_NULL) break;
+                              if (dyns[i].d_tag == DT_NEEDED && dyns[i].d_un.d_val < dynstrSize) {
+                                  out.neededLibs.emplace_back(dynstr + dyns[i].d_un.d_val);
+                              } else if (dyns[i].d_tag == DT_SONAME && dyns[i].d_un.d_val < dynstrSize) {
+                                  out.soname = std::string(dynstr + dyns[i].d_un.d_val);
+                              } else if (dyns[i].d_tag == DT_INIT && dyns[i].d_un.d_ptr != 0) {
+                                  out.hasDtInit = true;
+                                  out.dtInitOffset = dyns[i].d_un.d_ptr;
+                              }
+                          }
+                      }
+                  }
+              }
+
+              munmap(mapped, fileSize);
+              return out.validElf32Arm;
+          }
+
+          static bool CopyAndStageElf32(const std::string& inputPath, const std::string& outputPath) {
+              Elf32AuditResult audit;
+              if (!InspectElf32Image(inputPath, audit)) {
+                  LOGE("CopyAndStageElf32: input failed ELF32 validation: %s", inputPath.c_str());
+                  return false;
+              }
+
+              std::string dir = DirNameOf(inputPath);
+              if (!dir.empty()) {
+                  std::lock_guard<std::mutex> lock(g_mutex);
+                  g_lastScannedDir = dir;
+              }
+
+              if (inputPath == outputPath) {
+                  chmod(outputPath.c_str(), S_IRUSR | S_IXUSR);
+                  LOGI("CopyAndStageElf32: verified in-place ELF32 image %s (SONAME=%s, DT_NEEDED=%zu)",
+                       outputPath.c_str(), audit.soname.c_str(), audit.neededLibs.size());
+                  return true;
+              }
+
+              unlink(outputPath.c_str());
+              int inFd = open(inputPath.c_str(), O_RDONLY | O_CLOEXEC);
+              if (inFd < 0) {
+                  LOGE("CopyAndStageElf32: failed opening source %s", inputPath.c_str());
+                  return false;
+              }
+
+              int outFd = open(outputPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+              if (outFd < 0) {
+                  close(inFd);
+                  LOGE("CopyAndStageElf32: failed creating destination %s", outputPath.c_str());
+                  return false;
+              }
+
+              uint8_t buf[65536];
+              ssize_t n;
+              bool ok = true;
+              while ((n = read(inFd, buf, sizeof(buf))) > 0) {
+                  ssize_t written = 0;
+                  while (written < n) {
+                      ssize_t w = write(outFd, buf + written, static_cast<size_t>(n - written));
+                      if (w <= 0) {
+                          ok = false;
+                          break;
+                      }
+                      written += w;
+                  }
+                  if (!ok) break;
+              }
+              if (n < 0) ok = false;
+
+              fsync(outFd);
+              close(outFd);
+              close(inFd);
+
+              if (!ok) {
+                  unlink(outputPath.c_str());
+                  LOGE("CopyAndStageElf32: I/O error staging %s -> %s", inputPath.c_str(), outputPath.c_str());
+                  return false;
+              }
+
+              // Android 10 (API 29) W^X SELinux compliance: dynamically loaded binaries must be read+execute only
+              chmod(outputPath.c_str(), S_IRUSR | S_IXUSR);
+
+              Elf32AuditResult outAudit;
+              if (!InspectElf32Image(outputPath, outAudit)) {
+                  LOGE("CopyAndStageElf32: output verification failed for %s", outputPath.c_str());
+                  return false;
+              }
+
+              LOGI("CopyAndStageElf32: staged valid 32-bit ARM ELF %s -> %s (SONAME=%s)",
+                   inputPath.c_str(), outputPath.c_str(), outAudit.soname.c_str());
+              return true;
+          }
+
+          static void BootstrapNativeRuntimeChain(const std::string& searchDir) {
+              std::lock_guard<std::mutex> lock(g_mutex);
+
+              const char* systemLibs[] = {
+                  "liblog.so", "libdl.so", "libm.so", "libc.so",
+                  "libz.so", "libandroid.so", "libEGL.so", "libGLESv2.so"
+              };
+              for (const char* sysLib : systemLibs) {
+                  void* h = dlopen(sysLib, RTLD_NOW | RTLD_GLOBAL);
+                  if (h) g_preloadedHandles.push_back(h);
+              }
+
+              std::string activeDir = !searchDir.empty() ? searchDir : g_lastScannedDir;
+              if (!activeDir.empty()) {
+                  const char* supportChain[] = {
+                      "libc++_shared.so",
+                      "libfmod.so",
+                      "libHttpClient.Android.so",
+                      "libMediaDecoders_Android.so",
+                      "libconscrypt_jni.so",
+                      "libpairipcore.so",
+                      "libmaesdk.so",
+                      "libPlayFabMultiplayer.so"
+                  };
+                  for (const char* libName : supportChain) {
+                      std::string candidate = activeDir + "/" + libName;
+                      if (access(candidate.c_str(), R_OK) == 0) {
+                          chmod(candidate.c_str(), S_IRUSR | S_IXUSR);
+                          dlerror();
+                          void* h = dlopen(candidate.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                          if (h) {
+                              g_preloadedHandles.push_back(h);
+                              LOGI("BootstrapNativeRuntimeChain: preloaded %s", candidate.c_str());
+                          } else {
+                              const char* err = dlerror();
+                              LOGW("BootstrapNativeRuntimeChain: note on %s: %s",
+                                   candidate.c_str(), err ? err : "none");
+                          }
+                      }
+                  }
+              }
+
+              if (!g_modsPath.empty()) {
+                  DIR* dir = opendir(g_modsPath.c_str());
+                  if (dir) {
+                      struct dirent* ent;
+                      while ((ent = readdir(dir)) != nullptr) {
+                          std::string name(ent->d_name);
+                          if (name.size() > 3 && name.substr(name.size() - 3) == ".so") {
+                              std::string modSo = g_modsPath + "/" + name;
+                              Elf32AuditResult modAudit;
+                              if (InspectElf32Image(modSo, modAudit)) {
+                                  chmod(modSo.c_str(), S_IRUSR | S_IXUSR);
+                                  void* mh = dlopen(modSo.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                                  if (mh) {
+                                      g_preloadedHandles.push_back(mh);
+                                      LOGI("BootstrapNativeRuntimeChain: loaded ARMv7 mod %s", modSo.c_str());
+                                  }
+                              }
+                          }
+                      }
+                      closedir(dir);
+                  }
+              }
+
+              g_bootstrapped = true;
+              LOGI("BootstrapNativeRuntimeChain: GXCore ARMv7 bootstrap complete (sizeof(void*)=%zu)", sizeof(void*));
+          }
+
+          } // namespace gxcore
+
+          extern "C" {
+
+          // ============================================================================
+          // 1. NativeBridgeHelper JNI Exports (org.levimc.launcher.util.NativeBridgeHelper)
+          // ============================================================================
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage(
+                  JNIEnv* env, jclass /*clazz*/, jstring jInputPath) {
+              std::string inputPath = gxcore::JStringToStdString(env, jInputPath);
+              gxcore::Elf32AuditResult audit;
+              bool valid = gxcore::InspectElf32Image(inputPath, audit);
+              if (valid) {
+                  std::string dir = gxcore::DirNameOf(inputPath);
+                  if (!dir.empty()) {
+                      std::lock_guard<std::mutex> lock(gxcore::g_mutex);
+                      gxcore::g_lastScannedDir = dir;
+                  }
+                  LOGI("nativeScanImage(%s) -> VALID 32-bit ARM ELF (SONAME=%s, DT_NEEDED=%zu, hasDtInit=%d)",
+                       inputPath.c_str(), audit.soname.c_str(), audit.neededLibs.size(), audit.hasDtInit ? 1 : 0);
+              }
+              return valid ? JNI_TRUE : JNI_FALSE;
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeRewriteImage(
+                  JNIEnv* env, jclass /*clazz*/, jstring jInputPath, jstring jOutputPath) {
+              std::string inputPath = gxcore::JStringToStdString(env, jInputPath);
+              std::string outputPath = gxcore::JStringToStdString(env, jOutputPath);
+              bool ok = gxcore::CopyAndStageElf32(inputPath, outputPath);
+              return ok ? JNI_TRUE : JNI_FALSE;
+          }
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore(
+                  JNIEnv* /*env*/, jclass /*clazz*/) {
+              gxcore::BootstrapNativeRuntimeChain("");
+          }
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeSetupRuntime(
+                  JNIEnv* env, jclass /*clazz*/, jstring jModsPath) {
+              std::string modsPath = gxcore::JStringToStdString(env, jModsPath);
+              {
+                  std::lock_guard<std::mutex> lock(gxcore::g_mutex);
+                  gxcore::g_modsPath = modsPath;
+              }
+              gxcore::BootstrapNativeRuntimeChain("");
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeLoadMinecraftRuntime(
+                  JNIEnv* env, jclass /*clazz*/, jstring jLibDir) {
+              std::string libDir = gxcore::JStringToStdString(env, jLibDir);
+              gxcore::BootstrapNativeRuntimeChain(libDir);
+              if (!libDir.empty()) {
+                  std::string mcpePath = libDir + "/libminecraftpe.so";
+                  if (access(mcpePath.c_str(), R_OK) == 0) {
+                      chmod(mcpePath.c_str(), S_IRUSR | S_IXUSR);
+                      void* h = dlopen(mcpePath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                      if (!h) {
+                          const char* err = dlerror();
+                          LOGE("nativeLoadMinecraftRuntime: dlopen(%s) failed: %s",
+                               mcpePath.c_str(), err ? err : "unknown");
+                          return JNI_FALSE;
+                      }
+                      LOGI("nativeLoadMinecraftRuntime: libminecraftpe.so loaded at %p", h);
+                  }
+              }
+              return JNI_TRUE;
+          }
+
+          // ============================================================================
+          // 2. NativeImageGuard JNI Exports (org.levimc.launcher.util.NativeImageGuard)
+          // ============================================================================
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeImageGuard_nativeScanImage(
+                  JNIEnv* env, jclass clazz, jstring jInputPath) {
+              return Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage(env, clazz, jInputPath);
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeImageGuard_nativeRewriteImage(
+                  JNIEnv* env, jclass clazz, jstring jInputPath, jstring jOutputPath) {
+              return Java_org_levimc_launcher_util_NativeBridgeHelper_nativeRewriteImage(env, clazz, jInputPath, jOutputPath);
+          }
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_util_NativeImageGuard_nativeBootstrapGxCore(
+                  JNIEnv* env, jclass clazz) {
+              Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore(env, clazz);
+          }
+
+          // ============================================================================
+          // 3. MinecraftRuntimePreparer & MinecraftLauncher JNI Exports
+          // ============================================================================
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_core_minecraft_MinecraftRuntimePreparer_nativeSetupRuntime(
+                  JNIEnv* env, jobject /*thiz*/, jstring jModsPath) {
+              Java_org_levimc_launcher_util_NativeBridgeHelper_nativeSetupRuntime(env, nullptr, jModsPath);
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_core_minecraft_MinecraftRuntimePreparer_nativeLoadMinecraftRuntime(
+                  JNIEnv* env, jobject /*thiz*/, jstring jLibDir) {
+              return Java_org_levimc_launcher_util_NativeBridgeHelper_nativeLoadMinecraftRuntime(env, nullptr, jLibDir);
+          }
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_core_minecraft_MinecraftLauncher_nativeSetupRuntime(
+                  JNIEnv* env, jobject /*thiz*/, jstring jModsPath) {
+              Java_org_levimc_launcher_util_NativeBridgeHelper_nativeSetupRuntime(env, nullptr, jModsPath);
+          }
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
+              JNIEnv* env = nullptr;
+              if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+                  return JNI_ERR;
+              }
+              LOGI("JNI_OnLoad: libgxcore.so (32-bit ARMv7, API 29) initialized cleanly");
+              return JNI_VERSION_1_6;
+          }
+
+          } // extern "C"
+          EOF
+
+          cmake -S gxcore_build -B gxcore_build/out \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build gxcore_build/out --config Release
+
+      - name: Verify ELF32 Architecture, SONAME & Exported JNI Symbols
+        run: |
+          GXCORE_SO="gxcore_build/out/libgxcore.so"
+          file "$GXCORE_SO"
+          readelf -h "$GXCORE_SO"
+          readelf -d "$GXCORE_SO"
+          nm -D "$GXCORE_SO" | grep "Java_org_levimc_launcher"
+
+          readelf -h "$GXCORE_SO" | grep -q "Class:                             ELF32"
+          readelf -h "$GXCORE_SO" | grep -q "Machine:                           ARM"
+          readelf -d "$GXCORE_SO" | grep -q "Library soname: \[libgxcore.so\]"
+          nm -D "$GXCORE_SO" | grep -q "Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage"
+          nm -D "$GXCORE_SO" | grep -q "Java_org_levimc_launcher_util_NativeBridgeHelper_nativeRewriteImage"
+          nm -D "$GXCORE_SO" | grep -q "Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore"
+          nm -D "$GXCORE_SO" | grep -q "Java_org_levimc_launcher_core_minecraft_MinecraftRuntimePreparer_nativeSetupRuntime"
+          echo "=== ALL ELF32 & JNI SYMBOL CHECKS PASSED ==="
+
+      - name: Stage libgxcore.so into Project & Build Launcher APK (if app/ exists)
+        run: |
+          mkdir -p app/src/main/jniLibs/armeabi-v7a
+          cp -v gxcore_build/out/libgxcore.so app/src/main/jniLibs/armeabi-v7a/libgxcore.so
+          cp -v $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so \
+                app/src/main/jniLibs/armeabi-v7a/libc++_shared.so
+
+          if [ -f "app/build.gradle" ] || [ -f "app/build.gradle.kts" ]; then
+            chmod +x gradlew || true
+            if [ -f "./gradlew" ]; then
+              ./gradlew assembleDebug --no-daemon
+            else
+              gradle assembleDebug --no-daemon
+            fi
+          fi
+
+      - name: Upload Verified ARMv7 libgxcore.so Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgxcore-armeabi-v7a
+          path: |
+            gxcore_build/out/libgxcore.so
+            app/build/outputs/apk/debug/*.apk
