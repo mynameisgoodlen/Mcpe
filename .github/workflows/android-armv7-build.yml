@@ -1,0 +1,271 @@
+name: Build & Sign LeviLauncher ARMv7 (32-bit)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      apk_path:
+        description: "Optional path to an existing ARMv7 APK in the repo to patch & re-sign (leave blank for Gradle source build)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build-Tools, NDK, and Smali/Baksmali
+        run: |
+          sdkmanager --install "build-tools;34.0.0" "ndk;26.1.10909125" "platforms;android-34"
+          echo "BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_ENV
+          echo "NDK_CLANG=$ANDROID_HOME/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++" >> $GITHUB_ENV
+          curl -sSL https://github.com/JesusFreke/smali/releases/download/v2.5.2/baksmali-2.5.2.jar -o /tmp/baksmali.jar
+          curl -sSL https://github.com/JesusFreke/smali/releases/download/v2.5.2/smali-2.5.2.jar -o /tmp/smali.jar
+
+      - name: Compile 32-bit (armeabi-v7a) Compatibility Native Libraries
+        run: |
+          mkdir -p /tmp/native_armv7
+
+          cat << 'EOF' > /tmp/native_armv7/armv7_gxcore_compat.cpp
+          #include <jni.h>
+
+          extern "C" {
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              return JNI_VERSION_1_6;
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeScanImage(JNIEnv*, jclass, jstring) {
+              return JNI_FALSE;
+          }
+
+          JNIEXPORT jboolean JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeRewriteImage(JNIEnv*, jclass, jstring, jstring) {
+              return JNI_FALSE;
+          }
+
+          JNIEXPORT void JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeBootstrapGxCore(JNIEnv*, jclass) {
+          }
+
+          JNIEXPORT jstring JNICALL
+          Java_org_levimc_launcher_util_NativeBridgeHelper_nativeLoadMinecraftRuntime(JNIEnv*, jclass, jstring) {
+              return nullptr;
+          }
+
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/native_armv7/armv7_inbuiltmods_stub.cpp
+          #include <jni.h>
+
+          #define STUB_BOOL(cls, name) \
+              JNIEXPORT jboolean JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_##cls##_##name(JNIEnv*, jclass) { return JNI_FALSE; }
+
+          #define STUB_VOID(cls, name) \
+              JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_##cls##_##name(JNIEnv*, jclass) {}
+
+          extern "C" {
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              return JNI_VERSION_1_6;
+          }
+
+          // AutoSprintMod
+          STUB_BOOL(AutoSprintMod, nativeInit)
+          STUB_BOOL(AutoSprintMod, nativeIsEnabled)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_AutoSprintMod_nativeSetEnabled(JNIEnv*, jclass, jboolean) {}
+
+          // FpsMod
+          STUB_BOOL(FpsMod, nativeInit)
+          STUB_BOOL(FpsMod, nativeIsInitialized)
+          JNIEXPORT jint JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_FpsMod_nativeGetFps(JNIEnv*, jclass) { return 0; }
+
+          // GyroMod
+          STUB_BOOL(GyroMod, nativeInit)
+          STUB_BOOL(GyroMod, nativeIsEnabled)
+          STUB_BOOL(GyroMod, nativeIsInitialized)
+          STUB_VOID(GyroMod, nativePreResolve)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetDeadzone(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetEnabled(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetInvertX(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetInvertY(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetSensitivityX(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeSetSensitivityY(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_GyroMod_nativeUpdateDelta(JNIEnv*, jclass, jfloat, jfloat) {}
+
+          // HotbarSlotMod
+          STUB_BOOL(HotbarSlotMod, nativeInit)
+          STUB_BOOL(HotbarSlotMod, nativeItemIconsAvailable)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeClearSlot(JNIEnv*, jclass, jint) {}
+          JNIEXPORT jboolean JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeCopyItemCounts(JNIEnv*, jclass, jintArray) { return JNI_FALSE; }
+          JNIEXPORT jint JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeGameplayVisibilityState(JNIEnv*, jclass) { return 0; }
+          JNIEXPORT jint JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeGetItemCount(JNIEnv*, jclass, jint) { return 0; }
+          JNIEXPORT jboolean JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeHasItem(JNIEnv*, jclass, jint) { return JNI_FALSE; }
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeSetEnabled(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeSetItemIconsEnabled(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeSetOverlayEnabled(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_HotbarSlotMod_nativeSetSlotState(JNIEnv*, jclass, jint, jboolean, jint) {}
+
+          // MoreButtonsMod & PojavControlsMod
+          STUB_BOOL(MoreButtonsMod, nativeInit)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_MoreButtonsMod_nativeSendKey(JNIEnv*, jclass, jint, jboolean) {}
+          STUB_BOOL(PojavControlsMod, nativeInit)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSendKey(JNIEnv*, jclass, jint, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSendLookDelta(JNIEnv*, jclass, jfloat, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSendMouseButton(JNIEnv*, jclass, jint, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSendPointer(JNIEnv*, jclass, jfloat, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSendScroll(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_PojavControlsMod_nativeSetEnabled(JNIEnv*, jclass, jboolean) {}
+
+          // SnaplookMod & ZoomMod
+          STUB_BOOL(SnaplookMod, nativeInit)
+          STUB_BOOL(SnaplookMod, nativeIsActive)
+          STUB_BOOL(SnaplookMod, nativeIsInitialized)
+          STUB_VOID(SnaplookMod, nativeOnKeyDown)
+          STUB_VOID(SnaplookMod, nativeOnKeyUp)
+          STUB_BOOL(ZoomMod, nativeInit)
+          STUB_BOOL(ZoomMod, nativeIsZooming)
+          STUB_VOID(ZoomMod, nativeOnKeyDown)
+          STUB_VOID(ZoomMod, nativeOnKeyUp)
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_ZoomMod_nativeOnScroll(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT jfloat JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_ZoomMod_nativeGetZoomLevel(JNIEnv*, jclass) { return 1.0f; }
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_ZoomMod_nativeSetAnimated(JNIEnv*, jclass, jboolean) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_ZoomMod_nativeSetTransitionDuration(JNIEnv*, jclass, jfloat) {}
+          JNIEXPORT void JNICALL Java_org_levimc_launcher_core_mods_inbuilt_nativemod_ZoomMod_nativeSetZoomLevel(JNIEnv*, jclass, jfloat) {}
+
+          }
+          EOF
+
+          "$NDK_CLANG" -shared -fPIC -Oz -s \
+            -Wl,-soname,libgxcore.so \
+            /tmp/native_armv7/armv7_gxcore_compat.cpp \
+            -o /tmp/native_armv7/libgxcore.so
+
+          "$NDK_CLANG" -shared -fPIC -Oz -s \
+            -Wl,-soname,libinbuiltmods.so \
+            /tmp/native_armv7/armv7_inbuiltmods_stub.cpp \
+            -o /tmp/native_armv7/libinbuiltmods.so
+
+      - name: Build from Gradle or Patch Existing APK in Repository
+        run: |
+          mkdir -p dist
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug -Pandroid.injected.build.abi=armeabi-v7a
+            RAW_APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+            cp "$RAW_APK" /tmp/unaligned.apk
+          else
+            TARGET_APK="${{ github.event.inputs.apk_path }}"
+            if [ -z "$TARGET_APK" ]; then
+              TARGET_APK=$(find . -maxdepth 2 -name "*.apk" | head -n 1)
+            fi
+            if [ -z "$TARGET_APK" ] || [ ! -f "$TARGET_APK" ]; then
+              echo "Error: No ./gradlew or .apk file found in repository root."
+              exit 1
+            fi
+            echo "Patching existing APK: $TARGET_APK"
+            cp "$TARGET_APK" /tmp/working.apk
+
+            # Extract classes3.dex, decompile with baksmali, patch loadRuntimeNativeLibrary to use System.load, and recompile with smali
+            unzip -q -o /tmp/working.apk classes3.dex -d /tmp/dex_work
+            java -jar /tmp/baksmali.jar d /tmp/dex_work/classes3.dex -o /tmp/dex_work/smali_out
+
+            SMALI_FILE="/tmp/dex_work/smali_out/org/levimc/launcher/core/minecraft/GamePackageManager.smali"
+            if [ -f "$SMALI_FILE" ]; then
+              python3 -c '
+          with open("/tmp/dex_work/smali_out/org/levimc/launcher/core/minecraft/GamePackageManager.smali", "r") as f:
+              s = f.read()
+
+          # Replace reflective Runtime.load(String, ClassLoader) inside loadRuntimeNativeLibrary with direct System.load(file.getAbsolutePath())
+          start_marker = ".method private final loadRuntimeNativeLibrary(Ljava/io/File;)V"
+          end_marker = ".end method"
+          idx1 = s.find(start_marker)
+          if idx1 != -1:
+              idx2 = s.find(end_marker, idx1)
+              replacement = """.method private final loadRuntimeNativeLibrary(Ljava/io/File;)V
+              .registers 4
+              invoke-virtual {p1}, Ljava/io/File;->getAbsolutePath()Ljava/lang/String;
+              move-result-object v0
+              invoke-static {v0}, Ljava/lang/System;->load(Ljava/lang/String;)V
+              return-void
+          .end method"""
+              s = s[:idx1] + replacement + s[idx2 + len(end_marker):]
+              with open("/tmp/dex_work/smali_out/org/levimc/launcher/core/minecraft/GamePackageManager.smali", "w") as f:
+                  f.write(s)
+              print("Patched loadRuntimeNativeLibrary in GamePackageManager.smali")
+          '
+            fi
+
+            java -jar /tmp/smali.jar a /tmp/dex_work/smali_out -o /tmp/dex_work/classes3.dex
+
+            # Update APK in-place: keep classes3.dex uncompressed (-0) and inject compiled 32-bit native libraries
+            mkdir -p /tmp/dex_work/lib/armeabi-v7a
+            cp /tmp/native_armv7/libgxcore.so /tmp/dex_work/lib/armeabi-v7a/libgxcore.so
+            cp /tmp/native_armv7/libinbuiltmods.so /tmp/dex_work/lib/armeabi-v7a/libinbuiltmods.so
+
+            (cd /tmp/dex_work && zip -q -0 /tmp/working.apk classes3.dex)
+            (cd /tmp/dex_work && zip -q -9 /tmp/working.apk lib/armeabi-v7a/libgxcore.so lib/armeabi-v7a/libinbuiltmods.so)
+            zip -q -d /tmp/working.apk "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" "META-INF/MANIFEST.MF" || true
+            cp /tmp/working.apk /tmp/unaligned.apk
+          fi
+
+      - name: Align & Sign APK (v1 + v2 + v3 Schemes)
+        run: |
+          # 1. Align uncompressed entries (classes*.dex, baseline.prof, resources.arsc) to 4-byte boundaries and page-align .so files
+          "$BUILD_TOOLS/zipalign" -p -f -v 4 /tmp/unaligned.apk /tmp/aligned.apk
+
+          # 2. Generate a debug keystore with a backdated start timestamp (-startdate -1Y) so device clocks never reject it
+          rm -f /tmp/debug.keystore
+          keytool -genkeypair -v \
+            -keystore /tmp/debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -startdate -1Y \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          # 3. Sign with official Android apksigner (v1 + v2 + v3 enabled)
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks /tmp/debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out dist/LeviLauncher-ARMv7-signed.apk \
+            /tmp/aligned.apk
+
+          # 4. Verify APK signature and alignment
+          "$BUILD_TOOLS/zipalign" -c -v 4 dist/LeviLauncher-ARMv7-signed.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs dist/LeviLauncher-ARMv7-signed.apk
+
+      - name: Upload Signed ARMv7 APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviLauncher-ARMv7-signed
+          path: dist/LeviLauncher-ARMv7-signed.apk
+          if-no-files-found: error
