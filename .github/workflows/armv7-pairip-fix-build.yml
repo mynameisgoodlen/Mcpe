@@ -1,0 +1,152 @@
+name: ARMv7 PairIP Fix Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "tools/apply_armv7_pairip_fix.py"
+      - ".github/workflows/armv7-pairip-fix-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: armv7-pairip-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-armv7:
+    name: Patch and build armeabi-v7a APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source and native submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify complete source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f app/build.gradle || test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f app/src/main/cpp/preloader/CMakeLists.txt
+          test -f app/src/main/cpp/libHttpClient/Build/libHttpClient.Android/CMakeLists.txt
+          test -x ./gradlew || chmod +x ./gradlew
+          echo "Complete launcher source and native submodules are present."
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: "2.9.9"
+          actions-cache-folder: ".xmake-cache"
+          actions-cache-key: "ubuntu-24.04-armv7-pairip-fix"
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          link-to-sdk: true
+
+      - name: Prepare CI-only Google Services config
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "ci-placeholder",
+              "storage_bucket": "ci-placeholder.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                "android_client_info": {"package_name": "org.levimc.launcher"}
+              },
+              "oauth_client": [],
+              "api_key": [{"current_key": "AIzaSyCIOnlyPlaceholderKey"}],
+              "services": {"appinvite_service": {"other_platform_oauth_client": []}}
+            }],
+            "configuration_version": "1"
+          }
+          JSON
+
+      - name: Apply ARMv7 native dependency and split-APK fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/apply_armv7_pairip_fix.py
+          python3 tools/apply_armv7_pairip_fix.py
+          grep -q "ARMV7_PAIRIP_FIX_V2" app/src/main/java/org/levimc/launcher/core/minecraft/GamePackageManager.kt
+
+      - name: Build debug APKs
+        run: ./gradlew --no-daemon --stacktrace clean :app:assembleDebug
+
+      - name: Validate and stage ARMv7 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="$(find app/build/outputs/apk -type f -name '*armeabi-v7a*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::Gradle did not produce an armeabi-v7a APK."
+            find app/build/outputs/apk -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          apk = sys.argv[1]
+          with zipfile.ZipFile(apk) as z:
+              names = z.namelist()
+              libs = [n for n in names if n.startswith("lib/armeabi-v7a/") and n.endswith(".so")]
+              if not libs:
+                  raise SystemExit("::error::APK has no armeabi-v7a native libraries")
+              bad = []
+              for name in libs:
+                  h = z.read(name)[:20]
+                  if len(h) < 20 or h[:4] != b"\x7fELF" or h[4] != 1 or int.from_bytes(h[18:20], "little") != 40:
+                      bad.append(name)
+              if bad:
+                  raise SystemExit("::error::Non-ARM32 native libraries found: " + ", ".join(bad))
+              if not any(n.startswith("classes") and n.endswith(".dex") for n in names):
+                  raise SystemExit("::error::APK is missing DEX bytecode")
+              print(f"Validated {len(libs)} ELF32/EM_ARM native libraries in {apk}")
+          PY
+          cp "$APK" dist/LeviDroid-ARMv7-PairIP-Fixed-debug.apk
+          sha256sum dist/LeviDroid-ARMv7-PairIP-Fixed-debug.apk > dist/SHA256SUMS.txt
+
+      - name: Upload ARMv7 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeviDroid-ARMv7-PairIP-Fixed-Debug
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
